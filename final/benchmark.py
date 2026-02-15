@@ -20,11 +20,27 @@ MAX_DU_RW_BOUNDS = (1.0, 80.0)
 MAX_DU_BASE_BOUNDS = (0.1, 20.0)
 NOVELTY_MIN_DISTANCE = 0.12
 NOVELTY_MAX_ATTEMPTS = 300
+DEFAULT_CONTROLLER_FAMILIES = (
+    "current,hybrid_modern,paper_split_baseline,legacy_wheel_pid,legacy_wheel_lqr,legacy_run_pd"
+)
 
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Fast robustness benchmark + random-search tuner.")
     parser.add_argument("--seed", type=int, default=12345)
+    parser.add_argument(
+        "--benchmark-profile",
+        choices=["fast_pr", "nightly_long"],
+        default="nightly_long",
+        help="Runtime profile for CI/ops use.",
+    )
+    parser.add_argument(
+        "--controller-families",
+        type=str,
+        default=DEFAULT_CONTROLLER_FAMILIES,
+        help="Comma-separated controller families to benchmark.",
+    )
+    parser.add_argument("--significance-alpha", type=float, default=0.05)
     parser.add_argument("--episodes", type=int, default=None)
     parser.add_argument("--trials", type=int, default=None)
     parser.add_argument("--outdir", type=str, default="final/results")
@@ -60,15 +76,31 @@ def parse_args():
 
 
 def apply_stress_defaults(args):
-    defaults = {
+    profile_defaults = {
+        "fast_pr": {"episodes": 8, "trials": 20, "steps": 2000},
+        "nightly_long": {"episodes": 40, "trials": 200, "steps": 6000},
+    }[args.benchmark_profile]
+    stress_defaults = {
         "fast": {"episodes": 12, "trials": 60, "steps": 3000},
         "medium": {"episodes": 24, "trials": 120, "steps": 4000},
         "long": {"episodes": 40, "trials": 200, "steps": 6000},
     }[args.stress_level]
+    defaults = profile_defaults if args.benchmark_profile == "fast_pr" else stress_defaults
     episodes = int(args.episodes) if args.episodes is not None else defaults["episodes"]
     trials = int(args.trials) if args.trials is not None else defaults["trials"]
     steps = int(args.steps) if args.steps is not None else defaults["steps"]
     return episodes, trials, steps
+
+
+def parse_controller_families(raw: str) -> List[str]:
+    families = [f.strip() for f in str(raw).split(",") if f.strip()]
+    if not families:
+        return ["current"]
+    unique = []
+    for fam in families:
+        if fam not in unique:
+            unique.append(fam)
+    return unique
 
 
 def get_mode_matrix(compare_modes: str):
@@ -190,6 +222,7 @@ def baseline_candidate() -> CandidateParams:
 def make_row(
     run_id: str,
     mode_id: str,
+    controller_family: str,
     is_baseline: bool,
     seed: int,
     episodes: int,
@@ -199,9 +232,12 @@ def make_row(
     params: CandidateParams,
     metrics: Dict[str, float],
 ) -> Dict[str, object]:
+    metrics_copy = dict(metrics)
+    episode_scores = metrics_copy.pop("episode_score_list", [])
     return {
         "run_id": run_id,
         "mode_id": mode_id,
+        "controller_family": controller_family,
         "is_baseline": is_baseline,
         "seed": seed,
         "episodes": episodes,
@@ -225,8 +261,9 @@ def make_row(
         "MAX_DU_rw": params.max_du_rw,
         "MAX_DU_bx": params.max_du_bx,
         "MAX_DU_by": params.max_du_by,
-        **metrics,
+        **metrics_copy,
         "delta_survival_rate": np.nan,
+        "delta_score_composite": np.nan,
         "delta_worst_base_norm": np.nan,
         "delta_worst_tilt": np.nan,
         "delta_mean_control_energy": np.nan,
@@ -234,11 +271,17 @@ def make_row(
         "delta_mean_motion_activity": np.nan,
         "delta_mean_ctrl_sign_flip_rate": np.nan,
         "delta_mean_osc_band_energy": np.nan,
+        "significance_pvalue": np.nan,
+        "significance_ci_low": np.nan,
+        "significance_ci_high": np.nan,
+        "promotion_pass": False,
+        "_episode_scores": episode_scores,
     }
 
 
 def add_deltas(rows: List[Dict[str, object]], baseline: Dict[str, object]):
     base_survival = float(baseline["survival_rate"])
+    base_score = float(baseline.get("score_composite", np.nan))
     base_worst_base = max(float(baseline["worst_base_x_m"]), float(baseline["worst_base_y_m"]))
     base_worst_tilt = max(float(baseline["worst_pitch_deg"]), float(baseline["worst_roll_deg"]))
     base_energy = float(baseline["mean_control_energy"])
@@ -249,6 +292,7 @@ def add_deltas(rows: List[Dict[str, object]], baseline: Dict[str, object]):
 
     for row in rows:
         row["delta_survival_rate"] = float(row["survival_rate"]) - base_survival
+        row["delta_score_composite"] = float(row.get("score_composite", np.nan)) - base_score
         row["delta_worst_base_norm"] = max(float(row["worst_base_x_m"]), float(row["worst_base_y_m"])) - base_worst_base
         row["delta_worst_tilt"] = max(float(row["worst_pitch_deg"]), float(row["worst_roll_deg"])) - base_worst_tilt
         row["delta_mean_control_energy"] = float(row["mean_control_energy"]) - base_energy
@@ -274,12 +318,14 @@ def sort_key(row: Dict[str, object], primary_objective: str = "crash-rate"):
     failure = str(row.get("failure_reason", ""))
     wheel_over_budget = float(row.get("wheel_over_budget_mean", 0.0))
     wheel_over_hard = float(row.get("wheel_over_hard_mean", 0.0))
+    score_composite = float(row.get("score_composite", np.nan))
     objective = worst_base + command_jerk
     failure_penalty = 1 if failure else 0
     if primary_objective == "crash-rate":
         return (
             -survival,
             crash_rate,
+            -score_composite,
             worst_tilt,
             wheel_over_hard,
             wheel_over_budget,
@@ -295,6 +341,7 @@ def sort_key(row: Dict[str, object], primary_objective: str = "crash-rate"):
             wheel_over_hard,
             wheel_over_budget,
             -survival,
+            -score_composite,
             crash_rate,
             worst_tilt,
             worst_base,
@@ -306,6 +353,7 @@ def sort_key(row: Dict[str, object], primary_objective: str = "crash-rate"):
         )
     return (
         -int(full_survival),
+        -score_composite,
         objective,
         worst_base,
         command_jerk,
@@ -321,14 +369,38 @@ def sort_key(row: Dict[str, object], primary_objective: str = "crash-rate"):
     )
 
 
+def paired_bootstrap_significance(
+    base_scores: List[float],
+    cand_scores: List[float],
+    rng: np.random.Generator,
+    n_boot: int = 2000,
+) -> Tuple[float, float, float, float]:
+    base = np.asarray(base_scores, dtype=float)
+    cand = np.asarray(cand_scores, dtype=float)
+    n = min(base.size, cand.size)
+    if n == 0:
+        return np.nan, np.nan, np.nan, np.nan
+    d = cand[:n] - base[:n]
+    obs = float(np.mean(d))
+    idx = rng.integers(0, n, size=(n_boot, n))
+    means = d[idx].mean(axis=1)
+    ci_low = float(np.quantile(means, 0.025))
+    ci_high = float(np.quantile(means, 0.975))
+    p_lo = float(np.mean(means <= 0.0))
+    p_hi = float(np.mean(means >= 0.0))
+    p_value = float(2.0 * min(p_lo, p_hi))
+    return obs, p_value, ci_low, ci_high
+
+
 def write_csv(path: Path, rows: List[Dict[str, object]]):
     if not rows:
         return
-    fieldnames = list(rows[0].keys())
+    clean_rows = [{k: v for k, v in row.items() if not str(k).startswith("_")} for row in rows]
+    fieldnames = list(clean_rows[0].keys())
     with path.open("w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
-        writer.writerows(rows)
+        writer.writerows(clean_rows)
 
 
 def write_summary(path: Path, rows: List[Dict[str, object]], primary_objective: str):
@@ -336,58 +408,57 @@ def write_summary(path: Path, rows: List[Dict[str, object]], primary_objective: 
     lines.append(f"OBJECTIVE={primary_objective}")
     lines.append("")
 
-    mode_ids = sorted({str(r["mode_id"]) for r in rows})
-    baseline_by_mode = {}
-    for mode in mode_ids:
-        mode_base = [r for r in rows if str(r["mode_id"]) == mode and bool(r["is_baseline"])]
-        if mode_base:
-            baseline_by_mode[mode] = mode_base[0]
-    lines.append("BASELINE BY MODE")
-    for mode in mode_ids:
-        b = baseline_by_mode.get(mode)
+    keys = sorted({(str(r["mode_id"]), str(r.get("controller_family", "current"))) for r in rows})
+    baseline_by_key = {}
+    for mode, family in keys:
+        base_rows = [
+            r
+            for r in rows
+            if str(r["mode_id"]) == mode and str(r.get("controller_family", "current")) == family and bool(r["is_baseline"])
+        ]
+        if base_rows:
+            baseline_by_key[(mode, family)] = base_rows[0]
+    lines.append("BASELINE BY MODE/FAMILY")
+    for mode, family in keys:
+        b = baseline_by_key.get((mode, family))
         if b is None:
             continue
         lines.append(
-            f"{mode}: preset={b.get('preset')} stability_profile={b.get('stability_profile')} "
+            f"{mode}/{family}: preset={b.get('preset')} stability_profile={b.get('stability_profile')} "
             f"survival={float(b['survival_rate']):.3f} crash_rate={float(b.get('crash_rate', np.nan)):.3f} "
+            f"score={float(b.get('score_composite', np.nan)):.3f} "
             f"wheel_over_budget={float(b.get('wheel_over_budget_mean', 0.0)):.3f} "
             f"wheel_over_hard={float(b.get('wheel_over_hard_mean', 0.0)):.3f}"
         )
     lines.append("")
 
-    if len(mode_ids) >= 2 and all(m in baseline_by_mode for m in mode_ids[:2]):
-        a = baseline_by_mode[mode_ids[0]]
-        b = baseline_by_mode[mode_ids[1]]
-        lines.append("BASELINE DELTA (mode2 - mode1)")
-        lines.append(
-            f"{mode_ids[1]} - {mode_ids[0]}: "
-            f"d_survival={float(b['survival_rate']) - float(a['survival_rate']):+.3f} "
-            f"d_crash_rate={float(b.get('crash_rate', np.nan)) - float(a.get('crash_rate', np.nan)):+.3f} "
-            f"d_wheel_budget={float(b.get('wheel_over_budget_mean', 0.0)) - float(a.get('wheel_over_budget_mean', 0.0)):+.3f} "
-            f"d_wheel_hard={float(b.get('wheel_over_hard_mean', 0.0)) - float(a.get('wheel_over_hard_mean', 0.0)):+.3f}"
-        )
-        lines.append("")
-
-    lines.append("TOP ACCEPTED PER MODE")
-    for mode in mode_ids:
-        mode_rows = [r for r in rows if str(r["mode_id"]) == mode and not bool(r["is_baseline"])]
+    lines.append("TOP ACCEPTED PER MODE/FAMILY")
+    for mode, family in keys:
+        mode_rows = [
+            r
+            for r in rows
+            if str(r["mode_id"]) == mode and str(r.get("controller_family", "current")) == family and not bool(r["is_baseline"])
+        ]
         accepted = [r for r in mode_rows if bool(r["accepted_gate"])]
         if accepted:
             top = sorted(accepted, key=lambda r: sort_key(r, primary_objective))[0]
             lines.append(
-                f"{mode}: {top['run_id']} survival={float(top['survival_rate']):.3f} "
+                f"{mode}/{family}: {top['run_id']} survival={float(top['survival_rate']):.3f} "
                 f"crash_rate={float(top.get('crash_rate', np.nan)):.3f} "
+                f"score={float(top.get('score_composite', np.nan)):.3f} "
                 f"worst_tilt={max(float(top['worst_pitch_deg']), float(top['worst_roll_deg'])):.3f}deg "
                 f"wheel_over_budget={float(top.get('wheel_over_budget_mean', 0.0)):.3f} "
-                f"wheel_over_hard={float(top.get('wheel_over_hard_mean', 0.0)):.3f}"
+                f"wheel_over_hard={float(top.get('wheel_over_hard_mean', 0.0)):.3f} "
+                f"p={float(top.get('significance_pvalue', np.nan)):.4f} "
+                f"promotion_pass={bool(top.get('promotion_pass', False))}"
             )
         else:
             fallback = sorted(mode_rows, key=lambda r: sort_key(r, primary_objective))[0] if mode_rows else None
             if fallback is None:
-                lines.append(f"{mode}: no rows")
+                lines.append(f"{mode}/{family}: no rows")
             else:
                 lines.append(
-                    f"{mode}: no accepted candidate, fallback={fallback['run_id']} "
+                    f"{mode}/{family}: no accepted candidate, fallback={fallback['run_id']} "
                     f"survival={float(fallback['survival_rate']):.3f} "
                     f"reason={fallback.get('failure_reason', '')}"
                 )
@@ -437,30 +508,41 @@ def maybe_plot(path: Path, rows: List[Dict[str, object]], baseline: Dict[str, ob
 
 def print_report(rows: List[Dict[str, object]], primary_objective: str):
     print(f"\n=== BENCHMARK REPORT ({primary_objective}) ===")
-    mode_ids = sorted({str(r["mode_id"]) for r in rows})
-    for mode in mode_ids:
-        baseline_rows = [r for r in rows if str(r["mode_id"]) == mode and bool(r["is_baseline"])]
+    keys = sorted({(str(r["mode_id"]), str(r.get("controller_family", "current"))) for r in rows})
+    for mode, family in keys:
+        baseline_rows = [
+            r
+            for r in rows
+            if str(r["mode_id"]) == mode and str(r.get("controller_family", "current")) == family and bool(r["is_baseline"])
+        ]
         if baseline_rows:
             b = baseline_rows[0]
             print(
-                f"{mode} baseline: preset={b.get('preset')} stability={b.get('stability_profile')} "
+                f"{mode}/{family} baseline: preset={b.get('preset')} stability={b.get('stability_profile')} "
                 f"survival={float(b['survival_rate']):.3f} crash_rate={float(b.get('crash_rate', np.nan)):.3f} "
+                f"score={float(b.get('score_composite', np.nan)):.3f} "
                 f"wheel_budget={float(b.get('wheel_over_budget_mean', 0.0)):.3f} "
                 f"wheel_hard={float(b.get('wheel_over_hard_mean', 0.0)):.3f}"
             )
-        candidates = [r for r in rows if str(r["mode_id"]) == mode and not bool(r["is_baseline"])]
+        candidates = [
+            r
+            for r in rows
+            if str(r["mode_id"]) == mode and str(r.get("controller_family", "current")) == family and not bool(r["is_baseline"])
+        ]
         accepted = [r for r in candidates if bool(r["accepted_gate"])]
         if accepted:
             top = sorted(accepted, key=lambda r: sort_key(r, primary_objective))[0]
             print(
-                f"{mode} top accepted: {top['run_id']} survival={float(top['survival_rate']):.3f} "
+                f"{mode}/{family} top accepted: {top['run_id']} survival={float(top['survival_rate']):.3f} "
                 f"crash_rate={float(top.get('crash_rate', np.nan)):.3f} "
-                f"worst_tilt={max(float(top['worst_pitch_deg']), float(top['worst_roll_deg'])):.3f}deg"
+                f"score={float(top.get('score_composite', np.nan)):.3f} "
+                f"worst_tilt={max(float(top['worst_pitch_deg']), float(top['worst_roll_deg'])):.3f}deg "
+                f"p={float(top.get('significance_pvalue', np.nan)):.4f} pass={bool(top.get('promotion_pass', False))}"
             )
         elif candidates:
             fb = sorted(candidates, key=lambda r: sort_key(r, primary_objective))[0]
             print(
-                f"{mode} fallback: {fb['run_id']} survival={float(fb['survival_rate']):.3f} "
+                f"{mode}/{family} fallback: {fb['run_id']} survival={float(fb['survival_rate']):.3f} "
                 f"reason={fb.get('failure_reason', '')}"
             )
 
@@ -472,6 +554,7 @@ def main():
     outdir.mkdir(parents=True, exist_ok=True)
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     mode_matrix = get_mode_matrix(args.compare_modes)
+    controller_families = parse_controller_families(args.controller_families)
     model_path = Path(__file__).with_name("final.xml")
     try:
         evaluator = ControllerEvaluator(model_path)
@@ -498,9 +581,10 @@ def main():
         flush=True,
     )
     print(
-        f"Compare modes={args.compare_modes}, objective={args.primary_objective}, stress={args.stress_level}",
+        f"Compare modes={args.compare_modes}, objective={args.primary_objective}, stress={args.stress_level}, profile={args.benchmark_profile}",
         flush=True,
     )
+    print(f"Controller families={','.join(controller_families)}", flush=True)
     t0 = time.perf_counter()
 
     base_params = baseline_candidate()
@@ -516,65 +600,111 @@ def main():
         seen_candidate_vecs.append(cand_vec)
         candidate_specs.append((f"trial_{i:03d}", False, params))
 
-    total_evals = len(candidate_specs) * len(mode_matrix)
+    total_evals = len(candidate_specs) * len(mode_matrix) * len(controller_families)
     done_evals = 0
     for mode_id, preset, stability_profile in mode_matrix:
-        episode_config = EpisodeConfig(
-            steps=steps,
-            disturbance_magnitude_xy=args.disturbance_xy,
-            disturbance_magnitude_z=args.disturbance_z,
-            disturbance_interval=args.disturbance_interval,
-            init_angle_deg=args.init_angle_deg,
-            init_base_pos_m=args.init_base_pos_m,
-            max_worst_tilt_deg=args.gate_max_worst_tilt,
-            max_worst_base_m=args.gate_max_worst_base,
-            max_mean_sat_rate_du=args.gate_max_sat_du,
-            max_mean_sat_rate_abs=args.gate_max_sat_abs,
-            control_hz=args.control_hz,
-            control_delay_steps=args.control_delay_steps,
-            hardware_realistic=not args.legacy_model,
-            imu_angle_noise_std_rad=float(np.radians(args.imu_angle_noise_deg)),
-            imu_rate_noise_std_rad_s=args.imu_rate_noise,
-            wheel_encoder_ticks_per_rev=args.wheel_encoder_ticks,
-            wheel_encoder_rate_noise_std_rad_s=args.wheel_rate_noise,
-            preset=preset,
-            stability_profile=stability_profile,
-        )
-        print(
-            f"[mode] {mode_id}: preset={preset} stability_profile={stability_profile}",
-            flush=True,
-        )
-        for run_id, is_baseline, params in candidate_specs:
-            metrics = safe_evaluate_candidate(evaluator, params, episode_seeds, episode_config)
-            row = make_row(
-                run_id=run_id,
-                mode_id=mode_id,
-                is_baseline=is_baseline,
-                seed=args.seed,
-                episodes=episodes,
-                steps_per_episode=episode_config.steps,
+        for controller_family in controller_families:
+            episode_config = EpisodeConfig(
+                steps=steps,
+                disturbance_magnitude_xy=args.disturbance_xy,
+                disturbance_magnitude_z=args.disturbance_z,
+                disturbance_interval=args.disturbance_interval,
+                init_angle_deg=args.init_angle_deg,
+                init_base_pos_m=args.init_base_pos_m,
+                max_worst_tilt_deg=args.gate_max_worst_tilt,
+                max_worst_base_m=args.gate_max_worst_base,
+                max_mean_sat_rate_du=args.gate_max_sat_du,
+                max_mean_sat_rate_abs=args.gate_max_sat_abs,
+                control_hz=args.control_hz,
+                control_delay_steps=args.control_delay_steps,
+                hardware_realistic=not args.legacy_model,
+                imu_angle_noise_std_rad=float(np.radians(args.imu_angle_noise_deg)),
+                imu_rate_noise_std_rad_s=args.imu_rate_noise,
+                wheel_encoder_ticks_per_rev=args.wheel_encoder_ticks,
+                wheel_encoder_rate_noise_std_rad_s=args.wheel_rate_noise,
                 preset=preset,
                 stability_profile=stability_profile,
-                params=params,
-                metrics=metrics,
+                controller_family=controller_family,
             )
-            rows.append(row)
-            done_evals += 1
-            elapsed = time.perf_counter() - t0
-            per_eval = elapsed / max(done_evals, 1)
-            remaining = max(total_evals - done_evals, 0) * per_eval
             print(
-                f"\rProgress: {done_evals}/{total_evals} evals | elapsed {elapsed:6.1f}s | ETA {remaining:6.1f}s",
-                end="",
+                f"[mode] {mode_id}/{controller_family}: preset={preset} stability_profile={stability_profile}",
                 flush=True,
             )
+            for run_id, is_baseline, params in candidate_specs:
+                metrics = safe_evaluate_candidate(evaluator, params, episode_seeds, episode_config)
+                row = make_row(
+                    run_id=run_id,
+                    mode_id=mode_id,
+                    controller_family=controller_family,
+                    is_baseline=is_baseline,
+                    seed=args.seed,
+                    episodes=episodes,
+                    steps_per_episode=episode_config.steps,
+                    preset=preset,
+                    stability_profile=stability_profile,
+                    params=params,
+                    metrics=metrics,
+                )
+                rows.append(row)
+                done_evals += 1
+                elapsed = time.perf_counter() - t0
+                per_eval = elapsed / max(done_evals, 1)
+                remaining = max(total_evals - done_evals, 0) * per_eval
+                print(
+                    f"\rProgress: {done_evals}/{total_evals} evals | elapsed {elapsed:6.1f}s | ETA {remaining:6.1f}s",
+                    end="",
+                    flush=True,
+                )
     print("", flush=True)
 
-    for mode_id, _, _ in mode_matrix:
-        mode_rows = [r for r in rows if str(r["mode_id"]) == mode_id]
-        baseline_rows = [r for r in mode_rows if bool(r["is_baseline"])]
+    # Delta metrics use each mode/family baseline.
+    keys = sorted({(str(r["mode_id"]), str(r.get("controller_family", "current"))) for r in rows})
+    for mode_id, controller_family in keys:
+        key_rows = [
+            r for r in rows if str(r["mode_id"]) == mode_id and str(r.get("controller_family", "current")) == controller_family
+        ]
+        baseline_rows = [r for r in key_rows if bool(r["is_baseline"])]
         if baseline_rows:
-            add_deltas(mode_rows, baseline_rows[0])
+            add_deltas(key_rows, baseline_rows[0])
+
+    # Significance + promotion are measured against the current-family baseline in the same mode.
+    sig_rng = np.random.default_rng(args.seed + 7919)
+    mode_ids = sorted({str(r["mode_id"]) for r in rows})
+    for mode_id in mode_ids:
+        baseline_current = next(
+            (
+                r
+                for r in rows
+                if str(r["mode_id"]) == mode_id and str(r.get("controller_family", "")) == "current" and bool(r["is_baseline"])
+            ),
+            None,
+        )
+        if baseline_current is None:
+            continue
+        base_scores = [float(v) for v in baseline_current.get("_episode_scores", [])]
+        base_survival = float(baseline_current.get("survival_rate", 0.0))
+        base_worst_tilt = max(float(baseline_current.get("worst_pitch_deg", np.inf)), float(baseline_current.get("worst_roll_deg", np.inf)))
+        for row in rows:
+            if str(row["mode_id"]) != mode_id or bool(row["is_baseline"]):
+                continue
+            cand_scores = [float(v) for v in row.get("_episode_scores", [])]
+            _, p_value, ci_low, ci_high = paired_bootstrap_significance(base_scores, cand_scores, sig_rng)
+            row["significance_pvalue"] = p_value
+            row["significance_ci_low"] = ci_low
+            row["significance_ci_high"] = ci_high
+            no_safety_regress = (
+                float(row.get("survival_rate", 0.0)) >= base_survival
+                and max(float(row.get("worst_pitch_deg", np.inf)), float(row.get("worst_roll_deg", np.inf))) <= base_worst_tilt
+            )
+            score_improves = bool(float(row.get("score_composite", -np.inf)) > float(baseline_current.get("score_composite", np.inf)))
+            signif = bool(np.isfinite(p_value) and p_value < float(args.significance_alpha) and np.isfinite(ci_low) and ci_low > 0.0)
+            row["promotion_pass"] = bool(
+                str(row.get("controller_family", "")) == "hybrid_modern"
+                and bool(row.get("accepted_gate", False))
+                and no_safety_regress
+                and score_improves
+                and signif
+            )
     ranked = sorted(rows, key=lambda r: sort_key(r, args.primary_objective))
 
     print_report(ranked, args.primary_objective)

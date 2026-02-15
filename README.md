@@ -136,6 +136,14 @@ Run robust mode:
 python final/final.py --mode robust --stability-profile low-spin-robust
 ```
 
+Run controller families:
+
+```bash
+python final/final.py --mode smooth --controller-family current
+python final/final.py --mode smooth --controller-family hybrid_modern
+python final/final.py --mode smooth --controller-family paper_split_baseline
+```
+
 Play with scripted push disturbance:
 
 ```bash
@@ -153,6 +161,38 @@ Useful checks:
 ```bash
 python final/test_export_parity.py
 python final/export_firmware_params.py --mode smooth
+```
+
+## Modernization Notes
+
+- The runtime now supports controller families:
+  - `current` (backward-compatible baseline),
+  - `hybrid_modern` (preferred modernized controller),
+  - `paper_split_baseline` (literature-style comparator).
+- `hybrid_modern` is not a paper copy. It keeps the model-based core and adds explicit interpretable terms.
+- Optional explainability logging:
+  - `--log-control-terms`
+  - `--control-terms-csv <path>`
+
+## Benchmark Protocol
+
+- Main benchmark script: `final/benchmark.py`
+- Families are benchmarked side-by-side via `--controller-families`.
+- Composite score + hard gates are computed for each candidate.
+- Promotion is decided for `hybrid_modern` vs `current` baseline with:
+  - hard safety gates,
+  - paired bootstrap significance test (`--significance-alpha`).
+
+Fast PR benchmark:
+
+```bash
+python final/benchmark.py --benchmark-profile fast_pr
+```
+
+Nightly long benchmark:
+
+```bash
+python final/benchmark.py --benchmark-profile nightly_long
 ```
 
 ## Known Limitations

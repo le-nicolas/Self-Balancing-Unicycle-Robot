@@ -131,6 +131,14 @@ Run robust profile:
 python final/final.py --mode robust --stability-profile low-spin-robust
 ```
 
+Run controller families:
+
+```bash
+python final/final.py --mode smooth --controller-family current
+python final/final.py --mode smooth --controller-family hybrid_modern
+python final/final.py --mode smooth --controller-family paper_split_baseline
+```
+
 Try push disturbance:
 
 ```bash
@@ -143,7 +151,34 @@ Try hardware-like constraints:
 python final/final.py --mode robust --real-hardware
 ```
 
-## 8) Known Limits
+## 8) Why This Is Modern
+
+- It uses a hybrid architecture: model-based core with explicit safety shaping.
+- It includes a literature-style comparator (`paper_split_baseline`) for fair evaluation.
+- It supports interpretable term logging (`--log-control-terms`) so each command can be traced to named terms.
+
+## 9) Benchmark Protocol
+
+- Run with `final/benchmark.py`.
+- Default benchmark compares multiple controller families and operating modes.
+- Uses:
+  - hard stability/saturation gates,
+  - composite score,
+  - paired bootstrap significance for promotion decisions.
+
+Fast PR profile:
+
+```bash
+python final/benchmark.py --benchmark-profile fast_pr
+```
+
+Nightly long profile:
+
+```bash
+python final/benchmark.py --benchmark-profile nightly_long
+```
+
+## 10) Known Limits
 
 - This is still a simulation, not a certified hardware safety system.
 - Contact/friction/sensor models are approximations.

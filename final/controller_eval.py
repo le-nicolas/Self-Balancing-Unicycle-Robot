@@ -48,6 +48,7 @@ class EpisodeConfig:
     wheel_encoder_rate_noise_std_rad_s: float = 0.01
     preset: str = "default"
     stability_profile: str = "default"
+    controller_family: str = "current"
 
 
 class ControllerEvaluator:
@@ -117,6 +118,35 @@ class ControllerEvaluator:
         ],
         dtype=float,
     )
+
+    @staticmethod
+    def _fuzzy_roll_gain(roll: float, roll_rate: float, angle_scale: float, rate_scale: float) -> float:
+        roll_n = abs(roll) / max(angle_scale, 1e-6)
+        rate_n = abs(roll_rate) / max(rate_scale, 1e-6)
+        level = float(np.clip(0.65 * roll_n + 0.35 * rate_n, 0.0, 1.0))
+        return 0.35 + 0.95 * level
+
+    def _episode_composite_score(self, ep: Dict[str, float], steps: int) -> float:
+        survived = float(ep["survived"])
+        max_tilt = max(float(ep["max_abs_pitch_deg"]), float(ep["max_abs_roll_deg"]))
+        max_base = max(float(ep["max_abs_base_x_m"]), float(ep["max_abs_base_y_m"]))
+        energy = float(ep["control_energy"])
+        jerk = float(ep["mean_command_jerk"])
+        sat_du = float(ep["sat_rate_du"])
+        sat_abs = float(ep["sat_rate_abs"])
+        wheel_hard_ratio = float(ep["wheel_over_hard"]) / max(float(steps), 1.0)
+        wheel_budget_ratio = float(ep["wheel_over_budget"]) / max(float(steps), 1.0)
+        return (
+            100.0 * survived
+            - 1.8 * max_tilt
+            - 3.0 * max_base
+            - 0.06 * energy
+            - 0.2 * jerk
+            - 20.0 * sat_du
+            - 20.0 * sat_abs
+            - 12.0 * wheel_hard_ratio
+            - 3.0 * wheel_budget_ratio
+        )
 
     @staticmethod
     def _solve_discrete_are_robust(
@@ -352,9 +382,19 @@ class ControllerEvaluator:
         wheel_over_hard_count = 0
         high_spin_steps = 0
 
-        low_spin_robust = config.stability_profile == "low-spin-robust"
+        family = str(getattr(config, "controller_family", "current"))
+        low_spin_robust = (config.stability_profile == "low-spin-robust") and family in ("current", "hybrid_modern")
+        legacy_family = family in ("legacy_wheel_pid", "legacy_wheel_lqr", "legacy_run_pd")
+        paper_family = family == "paper_split_baseline"
+        hybrid_family = family == "hybrid_modern"
 
         k_du = self._build_lqr_gain(params)
+        a_w = self.A[np.ix_([0, 2, 4], [0, 2, 4])]
+        b_w = self.B[np.ix_([0, 2, 4], [0])]
+        q_w = np.diag([260.0, 35.0, 0.6])
+        r_w = np.array([[0.08]])
+        p_w = self._solve_discrete_are_robust(a_w, b_w, q_w, r_w, label="Paper pitch")
+        k_paper_pitch = self._solve_linear_robust(b_w.T @ p_w @ b_w + r_w, b_w.T @ p_w @ a_w, label="Paper pitch K")
         max_du = np.array([params.max_du_rw, params.max_du_bx, params.max_du_by], dtype=float)
         tilt_fail_rad = min(math.radians(config.max_worst_tilt_deg), self.CRASH_ANGLE_RAD)
 
@@ -417,7 +457,37 @@ class ControllerEvaluator:
 
                 rw_frac = abs(float(x_est[4])) / max(self.MAX_WHEEL_SPEED_RAD_S, 1e-6)
                 rw_damp_gain = 0.18 + 0.60 * max(0.0, rw_frac - 0.35)
-                du_rw_cmd = float(du_lqr[0] - rw_damp_gain * x_est[4])
+                if paper_family:
+                    xw = np.array([x_est[0], x_est[2], x_est[4]], dtype=float)
+                    u_pitch = float(-(k_paper_pitch @ xw)[0])
+                    s_roll = float(x_est[1] + 0.42 * x_est[3])
+                    kf = self._fuzzy_roll_gain(
+                        float(x_est[1]),
+                        float(x_est[3]),
+                        self.HOLD_EXIT_ANGLE_RAD,
+                        self.HOLD_EXIT_RATE_RAD_S,
+                    )
+                    u_roll_sm = float(-kf * np.tanh(s_roll / max(np.radians(0.5), 1e-3)) * 0.45 * self.MAX_U[0])
+                    du_rw_cmd = float((u_pitch + u_roll_sm) - u_eff_applied[0])
+                elif family == "legacy_wheel_pid":
+                    u_rw_target = float(-(30.0 * x_est[0] + 8.0 * x_est[2] + 0.08 * x_est[4]))
+                    du_rw_cmd = float(u_rw_target - u_eff_applied[0])
+                elif family == "legacy_wheel_lqr":
+                    xw = np.array([x_est[0], x_est[2], x_est[4]], dtype=float)
+                    u_rw_target = float(-(k_paper_pitch @ xw)[0])
+                    du_rw_cmd = float(u_rw_target - u_eff_applied[0])
+                elif family == "legacy_run_pd":
+                    u_rw_target = float(-(22.0 * x_est[0] + 6.0 * x_est[2]))
+                    du_rw_cmd = float(u_rw_target - u_eff_applied[0])
+                else:
+                    du_rw_cmd = float(du_lqr[0] - rw_damp_gain * x_est[4])
+                    if hybrid_family:
+                        du_rw_cmd += float(
+                            -(0.12 * self.BASE_PITCH_KP) * x_est[0]
+                            - (0.10 * self.BASE_PITCH_KD) * x_est[2]
+                            + (0.06 * self.BASE_ROLL_KP) * x_est[1]
+                            + (0.06 * self.BASE_ROLL_KD) * x_est[3]
+                        )
                 du_rw = float(np.clip(du_rw_cmd, -max_du[0], max_du[0]))
                 u_rw_unc = float(u_eff_applied[0] + du_rw)
                 u_rw_cmd = float(np.clip(u_rw_unc, -self.MAX_U[0], self.MAX_U[0]))
@@ -516,10 +586,25 @@ class ControllerEvaluator:
                 hold_y = -self.BASE_DAMPING_GAIN * x_est[8] - self.BASE_CENTERING_GAIN * base_y_err
                 balance_x = self.BASE_COMMAND_GAIN * (self.BASE_PITCH_KP * x_est[0] + self.BASE_PITCH_KD * x_est[2])
                 balance_y = -self.BASE_COMMAND_GAIN * (self.BASE_ROLL_KP * x_est[1] + self.BASE_ROLL_KD * x_est[3])
+                if hybrid_family:
+                    balance_x += float(-0.08 * self.BASE_ROLL_KP * x_est[1] - 0.05 * self.BASE_ROLL_KD * x_est[3])
+                    balance_y += float(0.08 * self.BASE_PITCH_KP * x_est[0] + 0.05 * self.BASE_PITCH_KD * x_est[2])
+                if paper_family:
+                    s_roll = float(x_est[1] + 0.42 * x_est[3])
+                    kf = self._fuzzy_roll_gain(
+                        float(x_est[1]),
+                        float(x_est[3]),
+                        self.HOLD_EXIT_ANGLE_RAD,
+                        self.HOLD_EXIT_RATE_RAD_S,
+                    )
+                    balance_y += float(-0.25 * kf * self.MAX_U[2] * np.tanh(s_roll / max(np.radians(0.5), 1e-3)))
                 base_target_x = (1.0 - base_authority) * hold_x + base_authority * balance_x
                 base_target_y = (1.0 - base_authority) * hold_y + base_authority * balance_y
                 base_target_x += -params.ki_base * base_int[0]
                 base_target_y += -params.ki_base * base_int[1]
+                if legacy_family:
+                    base_target_x = 0.0
+                    base_target_y = 0.0
                 if low_spin_robust:
                     budget_speed = min(
                         self.WHEEL_SPIN_BUDGET_FRAC * self.MAX_WHEEL_SPEED_RAD_S,
@@ -752,6 +837,7 @@ class ControllerEvaluator:
         config: EpisodeConfig,
     ) -> Dict[str, float]:
         per_episode = [self.simulate_episode(params, s, config) for s in episode_seeds]
+        episode_score_list = [self._episode_composite_score(m, config.steps) for m in per_episode]
 
         survival_rate = float(np.mean([m["survived"] for m in per_episode]))
         worst_pitch = float(np.max([m["max_abs_pitch_deg"] for m in per_episode]))
@@ -774,6 +860,7 @@ class ControllerEvaluator:
         high_spin_active_ratio_mean = float(np.mean([m.get("high_spin_active_ratio", 0.0) for m in per_episode]))
         crash_count_total = float(np.sum([m["crash_count"] for m in per_episode]))
         crash_rate = 1.0 - survival_rate
+        score_composite = float(np.mean(episode_score_list))
 
         crash_steps = [m["crash_step"] for m in per_episode if not np.isnan(m["crash_step"])]
         worst_crash_step = float(np.min(crash_steps)) if crash_steps else np.nan
@@ -800,6 +887,8 @@ class ControllerEvaluator:
 
         return {
             "survival_rate": survival_rate,
+            "score_composite": score_composite,
+            "episode_score_list": [float(v) for v in episode_score_list],
             "accepted_gate": accepted_gate,
             "worst_crash_step": worst_crash_step,
             "worst_pitch_deg": worst_pitch,
@@ -827,6 +916,7 @@ class ControllerEvaluator:
             "control_delay_steps": int(config.control_delay_steps),
             "preset": str(config.preset),
             "stability_profile": str(config.stability_profile),
+            "controller_family": str(config.controller_family),
         }
 
     def _oscillation_band_energy(
@@ -866,6 +956,8 @@ def safe_evaluate_candidate(
     except (LinAlgError, RuntimeError, ValueError, FloatingPointError):
         return {
             "survival_rate": 0.0,
+            "score_composite": -1e9,
+            "episode_score_list": [],
             "crash_rate": 1.0,
             "crash_count_total": float(len(episode_seeds)),
             "accepted_gate": False,
@@ -893,4 +985,5 @@ def safe_evaluate_candidate(
             "control_delay_steps": int(config.control_delay_steps),
             "preset": str(config.preset),
             "stability_profile": str(config.stability_profile),
+            "controller_family": str(config.controller_family),
         }

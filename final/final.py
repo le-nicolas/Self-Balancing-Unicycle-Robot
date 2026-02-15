@@ -1,6 +1,8 @@
 import argparse
+import csv
 from collections import deque
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 
 import mujoco
@@ -40,6 +42,9 @@ Run on your laptop/PC:
 
 @dataclass(frozen=True)
 class RuntimeConfig:
+    controller_family: str
+    log_control_terms: bool
+    control_terms_csv: str | None
     preset: str
     stability_profile: str
     stable_demo_profile: bool
@@ -336,6 +341,27 @@ def base_commands_with_limits(
 
 def parse_args():
     parser = argparse.ArgumentParser(description="MuJoCo wheel-on-stick viewer controller.")
+    parser.add_argument(
+        "--controller-family",
+        choices=[
+            "current",
+            "hybrid_modern",
+            "paper_split_baseline",
+        ],
+        default="current",
+        help="Controller family selector. 'current' preserves existing behavior.",
+    )
+    parser.add_argument(
+        "--log-control-terms",
+        action="store_true",
+        help="Log per-update interpretable control terms (headless-friendly CSV).",
+    )
+    parser.add_argument(
+        "--control-terms-csv",
+        type=str,
+        default=None,
+        help="Optional CSV output path for --log-control-terms.",
+    )
     parser.add_argument(
         "--preset",
         choices=["default", "stable-demo"],
@@ -751,6 +777,9 @@ def build_config(args) -> RuntimeConfig:
         control_delay_steps = max(control_delay_steps, 1)
 
     return RuntimeConfig(
+        controller_family=str(getattr(args, "controller_family", "current")),
+        log_control_terms=bool(getattr(args, "log_control_terms", False)),
+        control_terms_csv=getattr(args, "control_terms_csv", None),
         preset=preset,
         stability_profile=stability_profile,
         stable_demo_profile=stable_demo_profile,
@@ -954,6 +983,24 @@ def estimator_measurement_update(
     return x_est
 
 
+def _init_control_terms() -> dict[str, np.ndarray]:
+    return {
+        "term_lqr_core": np.zeros(3, dtype=float),
+        "term_roll_stability": np.zeros(3, dtype=float),
+        "term_pitch_stability": np.zeros(3, dtype=float),
+        "term_despin": np.zeros(3, dtype=float),
+        "term_base_hold": np.zeros(3, dtype=float),
+        "term_safety_shaping": np.zeros(3, dtype=float),
+    }
+
+
+def _fuzzy_roll_gain(cfg: RuntimeConfig, roll: float, roll_rate: float) -> float:
+    roll_n = abs(roll) / max(cfg.hold_exit_angle_rad, 1e-6)
+    rate_n = abs(roll_rate) / max(cfg.hold_exit_rate_rad_s, 1e-6)
+    level = float(np.clip(0.65 * roll_n + 0.35 * rate_n, 0.0, 1.0))
+    return 0.35 + 0.95 * level
+
+
 def compute_control_command(
     cfg: RuntimeConfig,
     x_est: np.ndarray,
@@ -970,12 +1017,14 @@ def compute_control_command(
     control_dt: float,
     K_du: np.ndarray,
     K_wheel_only: np.ndarray | None,
+    K_paper_pitch: np.ndarray | None,
     du_hits: np.ndarray,
     sat_hits: np.ndarray,
 ):
     """Controller core: delta-u LQR + wheel-only mode + base policy + safety shaping."""
     wheel_over_budget = False
     wheel_over_hard = False
+    terms = _init_control_terms()
     x_ctrl = x_est.copy()
     x_ctrl[5] -= cfg.x_ref
     x_ctrl[6] -= cfg.y_ref
@@ -990,6 +1039,75 @@ def compute_control_command(
     # saturation/delay/motor limits differ from requested command.
     z = np.concatenate([x_ctrl, u_eff_applied])
     du_lqr = -K_du @ z
+    terms["term_lqr_core"] = np.array([du_lqr[0], du_lqr[1], du_lqr[2]], dtype=float)
+
+    # Literature-style benchmark comparator:
+    # pitch = LQR channel, roll = sliding mode with fuzzy gain.
+    if cfg.controller_family == "paper_split_baseline":
+        xw = np.array([x_est[0], x_est[2], x_est[4]], dtype=float)
+        if K_paper_pitch is None:
+            u_pitch = float(-0.35 * x_est[0] - 0.11 * x_est[2] - 0.03 * x_est[4])
+        else:
+            u_pitch = float(-(K_paper_pitch @ xw)[0])
+        lam_roll = 0.42
+        phi = max(np.radians(0.5), 1e-3)
+        s_roll = float(x_est[1] + lam_roll * x_est[3])
+        k_fuzzy = _fuzzy_roll_gain(cfg, float(x_est[1]), float(x_est[3]))
+        u_roll_sm = float(-k_fuzzy * np.tanh(s_roll / phi) * 0.45 * cfg.max_u[0])
+
+        terms["term_pitch_stability"][0] = u_pitch
+        terms["term_roll_stability"][0] = u_roll_sm
+        u_rw_target = u_pitch + u_roll_sm
+        du_rw_cmd = float(u_rw_target - u_eff_applied[0])
+        rw_du_limit = cfg.max_du[0]
+        rw_u_limit = cfg.max_u[0]
+        du_hits[0] += int(abs(du_rw_cmd) > rw_du_limit)
+        du_rw = float(np.clip(du_rw_cmd, -rw_du_limit, rw_du_limit))
+        u_rw_unc = float(u_eff_applied[0] + du_rw)
+        sat_hits[0] += int(abs(u_rw_unc) > rw_u_limit)
+        u_rw_cmd = float(np.clip(u_rw_unc, -rw_u_limit, rw_u_limit))
+
+        hold_x = -cfg.base_damping_gain * x_est[7] - cfg.base_centering_gain * x_est[5]
+        hold_y = -cfg.base_damping_gain * x_est[8] - cfg.base_centering_gain * x_est[6]
+        terms["term_base_hold"][1:] = np.array([hold_x, hold_y], dtype=float)
+        if cfg.allow_base_motion:
+            balance_x = cfg.base_command_gain * (cfg.base_pitch_kp * x_est[0] + cfg.base_pitch_kd * x_est[2])
+            balance_y = -cfg.base_command_gain * (cfg.base_roll_kp * x_est[1] + cfg.base_roll_kd * x_est[3])
+            # Roll sliding compensation influences base y to emulate split-channel behavior.
+            balance_y += float(-0.25 * np.sign(s_roll) * cfg.max_u[2] * np.tanh(abs(s_roll) / phi))
+            terms["term_pitch_stability"][1] = balance_x
+            terms["term_roll_stability"][2] = balance_y
+            base_target = np.array([hold_x + balance_x, hold_y + balance_y], dtype=float)
+            du_base_cmd = base_target - u_eff_applied[1:]
+            du_hits[1:] += (np.abs(du_base_cmd) > cfg.max_du[1:]).astype(int)
+            du_base = np.clip(du_base_cmd, -cfg.max_du[1:], cfg.max_du[1:])
+            u_base_unc = u_eff_applied[1:] + du_base
+            sat_hits[1:] += (np.abs(u_base_unc) > cfg.max_u[1:]).astype(int)
+            u_base_cmd = np.clip(u_base_unc, -cfg.max_u[1:], cfg.max_u[1:])
+        else:
+            u_base_cmd = np.zeros(2, dtype=float)
+            base_int[:] = 0.0
+            base_ref[:] = 0.0
+            base_authority_state = 0.0
+            u_base_smooth[:] = 0.0
+
+        u_cmd = np.array([u_rw_cmd, u_base_cmd[0], u_base_cmd[1]], dtype=float)
+        if cfg.hardware_safe:
+            terms["term_safety_shaping"][1:] += u_cmd[1:] * (-0.75)
+            u_cmd[1:] = np.clip(0.25 * u_cmd[1:], -0.35, 0.35)
+        return (
+            u_cmd,
+            base_int,
+            base_ref,
+            base_authority_state,
+            u_base_smooth,
+            wheel_pitch_int,
+            rw_u_limit,
+            wheel_over_budget,
+            wheel_over_hard,
+            high_spin_active,
+            terms,
+        )
 
     if cfg.wheel_only:
         xw = np.array([x_est[0], x_est[2], x_est[4]], dtype=float)
@@ -1013,6 +1131,13 @@ def compute_control_command(
         rw_frac = abs(float(x_est[4])) / max(cfg.max_wheel_speed_rad_s, 1e-6)
         rw_damp_gain = 0.18 + 0.60 * max(0.0, rw_frac - 0.35)
         du_rw_cmd = float(du_lqr[0] - rw_damp_gain * x_est[4])
+        terms["term_despin"][0] += float(-rw_damp_gain * x_est[4])
+        if cfg.controller_family == "hybrid_modern":
+            pitch_stab = float(-(0.12 * cfg.base_pitch_kp) * x_est[0] - (0.10 * cfg.base_pitch_kd) * x_est[2])
+            roll_stab = float((0.06 * cfg.base_roll_kp) * x_est[1] + (0.06 * cfg.base_roll_kd) * x_est[3])
+            du_rw_cmd += pitch_stab + roll_stab
+            terms["term_pitch_stability"][0] += pitch_stab
+            terms["term_roll_stability"][0] += roll_stab
         rw_du_limit = cfg.max_du[0]
         rw_u_limit = cfg.max_u[0]
 
@@ -1028,6 +1153,7 @@ def compute_control_command(
         span = max(cfg.max_wheel_speed_rad_s - wheel_derate_start_speed, 1e-6)
         rw_scale = max(0.0, 1.0 - (wheel_speed_abs_est - wheel_derate_start_speed) / span)
         rw_cap = rw_u_limit * rw_scale
+        terms["term_safety_shaping"][0] += float(np.clip(u_rw_cmd, -rw_u_limit, rw_u_limit) - np.clip(u_rw_cmd, -rw_cap, rw_cap))
         u_rw_cmd = float(np.clip(u_rw_cmd, -rw_cap, rw_cap))
 
     # Explicit wheel momentum management: push wheel speed back toward zero.
@@ -1047,25 +1173,29 @@ def compute_control_command(
     if wheel_speed_abs_est > momentum_speed:
         pre_span = max(budget_speed - momentum_speed, 1e-6)
         pre_over = float(np.clip((wheel_speed_abs_est - momentum_speed) / pre_span, 0.0, 1.0))
-        u_rw_cmd += float(
+        despin_term = float(
             np.clip(
                 -np.sign(x_est[4]) * 0.35 * cfg.wheel_momentum_k * pre_over * rw_u_limit,
                 -0.30 * rw_u_limit,
                 0.30 * rw_u_limit,
             )
         )
+        terms["term_despin"][0] += despin_term
+        u_rw_cmd += despin_term
 
     if wheel_speed_abs_est > budget_speed:
         wheel_over_budget = True
         speed_span = max(hard_speed - budget_speed, 1e-6)
         over = np.clip((wheel_speed_abs_est - budget_speed) / speed_span, 0.0, 1.5)
-        u_rw_cmd += float(
+        despin_term = float(
             np.clip(
                 -np.sign(x_est[4]) * cfg.wheel_momentum_k * over * rw_u_limit,
                 -0.65 * rw_u_limit,
                 0.65 * rw_u_limit,
             )
         )
+        terms["term_despin"][0] += despin_term
+        u_rw_cmd += despin_term
         if (wheel_speed_abs_est <= hard_speed) and (not high_spin_active):
             rw_cap_scale = max(0.55, 1.0 - 0.45 * float(over))
         else:
@@ -1096,9 +1226,11 @@ def compute_control_command(
     )
     if near_upright_for_wheel:
         phase_scale = cfg.hold_wheel_despin_scale if balance_phase == "hold" else cfg.recovery_wheel_despin_scale
-        u_rw_cmd += float(
+        despin_term = float(
             np.clip(-phase_scale * cfg.wheel_momentum_upright_k * x_est[4], -0.35 * rw_u_limit, 0.35 * rw_u_limit)
         )
+        terms["term_despin"][0] += despin_term
+        u_rw_cmd += despin_term
     u_rw_cmd = float(np.clip(u_rw_cmd, -rw_u_limit, rw_u_limit))
 
     if cfg.allow_base_motion:
@@ -1126,8 +1258,19 @@ def compute_control_command(
         base_y_err = float(np.clip(x_est[6] - base_ref[1], -cfg.base_centering_pos_clip_m, cfg.base_centering_pos_clip_m))
         hold_x = -cfg.base_damping_gain * x_est[7] - cfg.base_centering_gain * base_x_err
         hold_y = -cfg.base_damping_gain * x_est[8] - cfg.base_centering_gain * base_y_err
+        terms["term_base_hold"][1:] = np.array([hold_x, hold_y], dtype=float)
         balance_x = cfg.base_command_gain * (cfg.base_pitch_kp * x_est[0] + cfg.base_pitch_kd * x_est[2])
         balance_y = -cfg.base_command_gain * (cfg.base_roll_kp * x_est[1] + cfg.base_roll_kd * x_est[3])
+        terms["term_pitch_stability"][1] = balance_x
+        terms["term_roll_stability"][2] = balance_y
+        if cfg.controller_family == "hybrid_modern":
+            # Hybrid modern: explicit cross-coupled stabilization terms.
+            cross_pitch = float(-0.08 * cfg.base_roll_kp * x_est[1] - 0.05 * cfg.base_roll_kd * x_est[3])
+            cross_roll = float(0.08 * cfg.base_pitch_kp * x_est[0] + 0.05 * cfg.base_pitch_kd * x_est[2])
+            balance_x += cross_pitch
+            balance_y += cross_roll
+            terms["term_roll_stability"][1] += cross_pitch
+            terms["term_pitch_stability"][2] += cross_roll
         base_target_x = (1.0 - base_authority) * hold_x + base_authority * balance_x
         base_target_y = (1.0 - base_authority) * hold_y + base_authority * balance_y
         if cfg.base_integrator_enabled and cfg.ki_base > 0.0:
@@ -1142,7 +1285,9 @@ def compute_control_command(
                 )
             )
             extra_bias = 1.25 if high_spin_active else 1.0
-            base_target_x += -np.sign(x_est[4]) * cfg.wheel_to_base_bias_gain * extra_bias * over_budget
+            bias_term = -np.sign(x_est[4]) * cfg.wheel_to_base_bias_gain * extra_bias * over_budget
+            terms["term_despin"][1] += bias_term
+            base_target_x += bias_term
 
         du_base_cmd = np.array([base_target_x, base_target_y]) - u_eff_applied[1:]
         base_du_limit = cfg.max_du[1:].copy()
@@ -1174,6 +1319,7 @@ def compute_control_command(
 
     u_cmd = np.array([u_rw_cmd, u_base_cmd[0], u_base_cmd[1]], dtype=float)
     if cfg.hardware_safe:
+        terms["term_safety_shaping"][1:] += u_cmd[1:] * (-0.75)
         u_cmd[1:] = np.clip(0.25 * u_cmd[1:], -0.35, 0.35)
 
     return (
@@ -1187,6 +1333,7 @@ def compute_control_command(
         wheel_over_budget,
         wheel_over_hard,
         high_spin_active,
+        terms,
     )
 
 
@@ -1297,14 +1444,15 @@ def main():
     Q_aug = np.block([[cfg.qx, np.zeros((NX, NU))], [np.zeros((NU, NX)), cfg.qu]])
     P_aug = solve_discrete_are(A_aug, B_aug, Q_aug, cfg.r_du)
     K_du = np.linalg.inv(B_aug.T @ P_aug @ B_aug + cfg.r_du) @ (B_aug.T @ P_aug @ A_aug)
+    A_w = A[np.ix_([0, 2, 4], [0, 2, 4])]
+    B_w = B[np.ix_([0, 2, 4], [0])]
+    Q_w = np.diag([260.0, 35.0, 0.6])
+    R_w = np.array([[0.08]])
+    P_w = solve_discrete_are(A_w, B_w, Q_w, R_w)
+    K_paper_pitch = np.linalg.inv(B_w.T @ P_w @ B_w + R_w) @ (B_w.T @ P_w @ A_w)
     K_wheel_only = None
     if cfg.wheel_only:
-        A_w = A[np.ix_([0, 2, 4], [0, 2, 4])]
-        B_w = B[np.ix_([0, 2, 4], [0])]
-        Q_w = np.diag([260.0, 35.0, 0.6])
-        R_w = np.array([[0.08]])
-        P_w = solve_discrete_are(A_w, B_w, Q_w, R_w)
-        K_wheel_only = np.linalg.inv(B_w.T @ P_w @ B_w + R_w) @ (B_w.T @ P_w @ A_w)
+        K_wheel_only = K_paper_pitch.copy()
 
     # 4) Build estimator model from configured sensor channels/noise.
     control_steps = 1 if not cfg.hardware_realistic else max(1, int(round(1.0 / (model.opt.timestep * cfg.control_hz))))
@@ -1330,6 +1478,7 @@ def main():
     print(f"A eigenvalues: {np.linalg.eigvals(A)}")
     print("\n=== DELTA-U LQR ===")
     print(f"K_du shape: {K_du.shape}")
+    print(f"controller_family={cfg.controller_family}")
     if K_wheel_only is not None:
         print(f"wheel_only_K: {K_wheel_only}")
     print("\n=== VIEWER MODE ===")
@@ -1481,6 +1630,47 @@ def main():
     wheel_over_hard_count = 0
     high_spin_steps = 0
     prev_script_force = np.zeros(3, dtype=float)
+    control_terms_writer = None
+    control_terms_file = None
+    if cfg.log_control_terms:
+        terms_path = (
+            Path(cfg.control_terms_csv)
+            if cfg.control_terms_csv
+            else Path(__file__).with_name("results") / f"control_terms_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+        )
+        terms_path.parent.mkdir(parents=True, exist_ok=True)
+        control_terms_file = terms_path.open("w", newline="", encoding="utf-8")
+        control_terms_writer = csv.DictWriter(
+            control_terms_file,
+            fieldnames=[
+                "step",
+                "sim_time_s",
+                "controller_family",
+                "balance_phase",
+                "term_lqr_core_rw",
+                "term_lqr_core_bx",
+                "term_lqr_core_by",
+                "term_roll_stability_rw",
+                "term_roll_stability_bx",
+                "term_roll_stability_by",
+                "term_pitch_stability_rw",
+                "term_pitch_stability_bx",
+                "term_pitch_stability_by",
+                "term_despin_rw",
+                "term_despin_bx",
+                "term_despin_by",
+                "term_base_hold_rw",
+                "term_base_hold_bx",
+                "term_base_hold_by",
+                "term_safety_shaping_rw",
+                "term_safety_shaping_bx",
+                "term_safety_shaping_by",
+                "u_cmd_rw",
+                "u_cmd_bx",
+                "u_cmd_by",
+            ],
+        )
+        control_terms_writer.writeheader()
 
     # 5) Closed-loop runtime: estimate -> control -> clamp -> simulate -> render.
     with mujoco.viewer.launch_passive(model, data) as viewer:
@@ -1547,6 +1737,7 @@ def main():
                     wheel_over_budget,
                     wheel_over_hard,
                     high_spin_active,
+                    control_terms,
                 ) = compute_control_command(
                     cfg=cfg,
                     x_est=x_est,
@@ -1563,6 +1754,7 @@ def main():
                     control_dt=control_dt,
                     K_du=K_du,
                     K_wheel_only=K_wheel_only,
+                    K_paper_pitch=K_paper_pitch,
                     du_hits=du_hits,
                     sat_hits=sat_hits,
                 )
@@ -1580,6 +1772,36 @@ def main():
                     rw_u_limit=rw_u_limit,
                 )
                 xml_limit_margin_hits += ((u_cmd < XML_CTRL_LOW) | (u_cmd > XML_CTRL_HIGH)).astype(int)
+                if control_terms_writer is not None:
+                    control_terms_writer.writerow(
+                        {
+                            "step": step_count,
+                            "sim_time_s": float(data.time),
+                            "controller_family": cfg.controller_family,
+                            "balance_phase": balance_phase,
+                            "term_lqr_core_rw": float(control_terms["term_lqr_core"][0]),
+                            "term_lqr_core_bx": float(control_terms["term_lqr_core"][1]),
+                            "term_lqr_core_by": float(control_terms["term_lqr_core"][2]),
+                            "term_roll_stability_rw": float(control_terms["term_roll_stability"][0]),
+                            "term_roll_stability_bx": float(control_terms["term_roll_stability"][1]),
+                            "term_roll_stability_by": float(control_terms["term_roll_stability"][2]),
+                            "term_pitch_stability_rw": float(control_terms["term_pitch_stability"][0]),
+                            "term_pitch_stability_bx": float(control_terms["term_pitch_stability"][1]),
+                            "term_pitch_stability_by": float(control_terms["term_pitch_stability"][2]),
+                            "term_despin_rw": float(control_terms["term_despin"][0]),
+                            "term_despin_bx": float(control_terms["term_despin"][1]),
+                            "term_despin_by": float(control_terms["term_despin"][2]),
+                            "term_base_hold_rw": float(control_terms["term_base_hold"][0]),
+                            "term_base_hold_bx": float(control_terms["term_base_hold"][1]),
+                            "term_base_hold_by": float(control_terms["term_base_hold"][2]),
+                            "term_safety_shaping_rw": float(control_terms["term_safety_shaping"][0]),
+                            "term_safety_shaping_bx": float(control_terms["term_safety_shaping"][1]),
+                            "term_safety_shaping_by": float(control_terms["term_safety_shaping"][2]),
+                            "u_cmd_rw": float(u_cmd[0]),
+                            "u_cmd_bx": float(u_cmd[1]),
+                            "u_cmd_by": float(u_cmd[2]),
+                        }
+                    )
                 u_applied = apply_control_delay(cfg, cmd_queue, u_cmd)
             if balance_phase == "hold":
                 hold_steps += 1
@@ -1671,6 +1893,9 @@ def main():
                     cmd_queue,
                 ) = reset_controller_buffers(NX, NU, queue_len)
                 continue
+
+    if control_terms_file is not None:
+        control_terms_file.close()
 
     print("\n=== SIMULATION ENDED ===")
     print(f"Total steps: {step_count}")
