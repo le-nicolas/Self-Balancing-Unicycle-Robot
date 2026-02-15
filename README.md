@@ -43,5 +43,4 @@ python final/export_firmware_params.py --mode smooth
 
 ## Notes
 
-- Generated benchmark outputs in `final/results/` are ignored by Git.
-- This repo currently does not include a software license file.
+- Benchmark result images (`final/results/*.png`) are tracked; raw CSV/TXT benchmark dumps are ignored.

@@ -14,7 +14,9 @@ env/
 # Logs and runtime output
 *.log
 MUJOCO_LOG.TXT
-final/results/
+final/results/**
+!final/results/
+!final/results/*.png
 
 # OS
 .DS_Store
