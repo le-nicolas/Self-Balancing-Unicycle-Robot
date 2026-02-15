@@ -10,6 +10,16 @@ It is written for two audiences:
 
 ### What this project does
 
+
+
+https://github.com/user-attachments/assets/ca2fff7d-20d3-4f47-b21a-2c3a8b4247ea
+
+
+
+<img width="836" height="696" alt="Screenshot 2026-02-15 134403" src="https://github.com/user-attachments/assets/9bb79145-424a-46d5-af1c-76f9d9f833f4" />
+
+
+
 Imagine trying to balance a broom upright on your hand.
 - The broom (robot body) wants to fall.
 - A fast spinning wheel inside the robot pushes back against that fall.
