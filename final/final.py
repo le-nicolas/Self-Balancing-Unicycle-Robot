@@ -45,6 +45,7 @@ class RuntimeConfig:
     controller_family: str
     log_control_terms: bool
     control_terms_csv: str | None
+    trace_events_csv: str | None
     preset: str
     stability_profile: str
     stable_demo_profile: bool
@@ -361,6 +362,12 @@ def parse_args():
         type=str,
         default=None,
         help="Optional CSV output path for --log-control-terms.",
+    )
+    parser.add_argument(
+        "--trace-events-csv",
+        type=str,
+        default=None,
+        help="Optional runtime trace/event CSV path for replay alignment.",
     )
     parser.add_argument(
         "--preset",
@@ -780,6 +787,7 @@ def build_config(args) -> RuntimeConfig:
         controller_family=str(getattr(args, "controller_family", "current")),
         log_control_terms=bool(getattr(args, "log_control_terms", False)),
         control_terms_csv=getattr(args, "control_terms_csv", None),
+        trace_events_csv=getattr(args, "trace_events_csv", None),
         preset=preset,
         stability_profile=stability_profile,
         stable_demo_profile=stable_demo_profile,
@@ -1632,6 +1640,8 @@ def main():
     prev_script_force = np.zeros(3, dtype=float)
     control_terms_writer = None
     control_terms_file = None
+    trace_events_writer = None
+    trace_events_file = None
     if cfg.log_control_terms:
         terms_path = (
             Path(cfg.control_terms_csv)
@@ -1671,6 +1681,31 @@ def main():
             ],
         )
         control_terms_writer.writeheader()
+    if cfg.trace_events_csv:
+        trace_path = Path(cfg.trace_events_csv)
+        trace_path.parent.mkdir(parents=True, exist_ok=True)
+        trace_events_file = trace_path.open("w", newline="", encoding="utf-8")
+        trace_events_writer = csv.DictWriter(
+            trace_events_file,
+            fieldnames=[
+                "step",
+                "sim_time_s",
+                "event",
+                "controller_family",
+                "balance_phase",
+                "pitch",
+                "roll",
+                "pitch_rate",
+                "roll_rate",
+                "wheel_rate",
+                "base_x",
+                "base_y",
+                "u_rw",
+                "u_bx",
+                "u_by",
+            ],
+        )
+        trace_events_writer.writeheader()
 
     # 5) Closed-loop runtime: estimate -> control -> clamp -> simulate -> render.
     with mujoco.viewer.launch_passive(model, data) as viewer:
@@ -1802,6 +1837,26 @@ def main():
                             "u_cmd_by": float(u_cmd[2]),
                         }
                     )
+                if trace_events_writer is not None:
+                    trace_events_writer.writerow(
+                        {
+                            "step": step_count,
+                            "sim_time_s": float(data.time),
+                            "event": "control_update",
+                            "controller_family": cfg.controller_family,
+                            "balance_phase": balance_phase,
+                            "pitch": float(x_true[0]),
+                            "roll": float(x_true[1]),
+                            "pitch_rate": float(x_true[2]),
+                            "roll_rate": float(x_true[3]),
+                            "wheel_rate": float(x_true[4]),
+                            "base_x": float(x_true[5]),
+                            "base_y": float(x_true[6]),
+                            "u_rw": float(u_cmd[0]),
+                            "u_bx": float(u_cmd[1]),
+                            "u_by": float(u_cmd[2]),
+                        }
+                    )
                 u_applied = apply_control_delay(cfg, cmd_queue, u_cmd)
             if balance_phase == "hold":
                 hold_steps += 1
@@ -1871,6 +1926,26 @@ def main():
 
             if abs(pitch) >= cfg.crash_angle_rad or abs(roll) >= cfg.crash_angle_rad:
                 crash_count += 1
+                if trace_events_writer is not None:
+                    trace_events_writer.writerow(
+                        {
+                            "step": step_count,
+                            "sim_time_s": float(data.time),
+                            "event": "crash",
+                            "controller_family": cfg.controller_family,
+                            "balance_phase": balance_phase,
+                            "pitch": float(pitch),
+                            "roll": float(roll),
+                            "pitch_rate": float(data.qvel[ids.v_pitch]),
+                            "roll_rate": float(data.qvel[ids.v_roll]),
+                            "wheel_rate": float(data.qvel[ids.v_rw]),
+                            "base_x": float(data.qpos[ids.q_base_x]),
+                            "base_y": float(data.qpos[ids.q_base_y]),
+                            "u_rw": float(u_eff_applied[0]),
+                            "u_bx": float(u_eff_applied[1]),
+                            "u_by": float(u_eff_applied[2]),
+                        }
+                    )
                 print(
                     f"\nCRASH #{crash_count} at step {step_count}: "
                     f"pitch={np.degrees(pitch):.2f}deg roll={np.degrees(roll):.2f}deg"
@@ -1896,6 +1971,8 @@ def main():
 
     if control_terms_file is not None:
         control_terms_file.close()
+    if trace_events_file is not None:
+        trace_events_file.close()
 
     print("\n=== SIMULATION ENDED ===")
     print(f"Total steps: {step_count}")

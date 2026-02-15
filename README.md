@@ -219,6 +219,19 @@ Nightly long benchmark:
 python final/benchmark.py --benchmark-profile nightly_long
 ```
 
+Release campaign (protocol-locked, cross-variant/domain, corrected significance):
+
+```bash
+python final/benchmark.py --release-campaign --multiple-comparison-correction holm --model-variants nominal,inertia_plus,friction_low,com_shift --domain-rand-profile default,rand_light,rand_medium
+```
+
+Hardware replay alignment (optional):
+
+```bash
+python final/benchmark.py --benchmark-profile nightly_long --hardware-trace-path path/to/hardware_trace.csv
+python final/final.py --mode smooth --trace-events-csv final/results/runtime_trace.csv
+```
+
 ## Known Limitations
 
 - This is still a simulation, not a certified safety controller.

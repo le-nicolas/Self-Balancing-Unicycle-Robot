@@ -191,6 +191,19 @@ Nightly long profile:
 python final/benchmark.py --benchmark-profile nightly_long
 ```
 
+Release campaign:
+
+```bash
+python final/benchmark.py --release-campaign --multiple-comparison-correction holm
+```
+
+Optional hardware replay:
+
+```bash
+python final/benchmark.py --benchmark-profile nightly_long --hardware-trace-path path/to/hardware_trace.csv
+python final/final.py --mode smooth --trace-events-csv final/results/runtime_trace.csv
+```
+
 ## 11) Known Limits
 
 - This is still a simulation, not a certified hardware safety system.

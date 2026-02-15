@@ -1,4 +1,5 @@
 import math
+import csv
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
@@ -49,6 +50,10 @@ class EpisodeConfig:
     preset: str = "default"
     stability_profile: str = "default"
     controller_family: str = "current"
+    model_variant_id: str = "nominal"
+    domain_profile_id: str = "default"
+    hardware_replay: bool = False
+    hardware_trace_path: str | None = None
 
 
 class ControllerEvaluator:
@@ -147,6 +152,30 @@ class ControllerEvaluator:
             - 12.0 * wheel_hard_ratio
             - 3.0 * wheel_budget_ratio
         )
+
+    @staticmethod
+    def _variant_scales(model_variant_id: str) -> tuple[float, float, float]:
+        vid = str(model_variant_id)
+        # (A_scale, B_scale, disturbance_scale)
+        return {
+            "nominal": (1.0, 1.0, 1.0),
+            "inertia_plus": (1.04, 0.90, 1.0),
+            "inertia_minus": (0.96, 1.10, 1.0),
+            "friction_low": (1.02, 0.95, 1.15),
+            "friction_high": (0.98, 1.05, 0.85),
+            "com_shift": (1.03, 0.93, 1.10),
+        }.get(vid, (1.0, 1.0, 1.0))
+
+    @staticmethod
+    def _domain_noise_scales(domain_profile_id: str) -> tuple[float, float]:
+        did = str(domain_profile_id)
+        # (sensor_noise_scale, timing_jitter_frac)
+        return {
+            "default": (1.0, 0.0),
+            "rand_light": (1.15, 0.05),
+            "rand_medium": (1.35, 0.10),
+            "rand_heavy": (1.65, 0.15),
+        }.get(did, (1.0, 0.0))
 
     @staticmethod
     def _solve_discrete_are_robust(
@@ -321,13 +350,20 @@ class ControllerEvaluator:
         ticks = max(int(config.wheel_encoder_ticks_per_rev), 1)
         return (2.0 * np.pi) / (ticks * control_dt)
 
-    def _build_measurement(self, x_true: np.ndarray, config: EpisodeConfig, wheel_lsb: float, rng: np.random.Generator):
-        pitch = x_true[0] + rng.normal(0.0, config.imu_angle_noise_std_rad)
-        roll = x_true[1] + rng.normal(0.0, config.imu_angle_noise_std_rad)
-        pitch_rate = x_true[2] + rng.normal(0.0, config.imu_rate_noise_std_rad_s)
-        roll_rate = x_true[3] + rng.normal(0.0, config.imu_rate_noise_std_rad_s)
+    def _build_measurement(
+        self,
+        x_true: np.ndarray,
+        config: EpisodeConfig,
+        wheel_lsb: float,
+        rng: np.random.Generator,
+        noise_scale: float = 1.0,
+    ):
+        pitch = x_true[0] + rng.normal(0.0, noise_scale * config.imu_angle_noise_std_rad)
+        roll = x_true[1] + rng.normal(0.0, noise_scale * config.imu_angle_noise_std_rad)
+        pitch_rate = x_true[2] + rng.normal(0.0, noise_scale * config.imu_rate_noise_std_rad_s)
+        roll_rate = x_true[3] + rng.normal(0.0, noise_scale * config.imu_rate_noise_std_rad_s)
         wheel_quant = np.round(x_true[4] / wheel_lsb) * wheel_lsb
-        wheel_rate = wheel_quant + rng.normal(0.0, config.wheel_encoder_rate_noise_std_rad_s)
+        wheel_rate = wheel_quant + rng.normal(0.0, noise_scale * config.wheel_encoder_rate_noise_std_rad_s)
         return np.array([pitch, roll, pitch_rate, roll_rate, wheel_rate], dtype=float)
 
     def simulate_episode(
@@ -338,11 +374,19 @@ class ControllerEvaluator:
     ) -> Dict[str, float]:
         rng = np.random.default_rng(episode_seed)
         self._reset_with_initial_state(rng, config)
+        a_scale, b_scale, disturbance_scale = self._variant_scales(config.model_variant_id)
+        noise_scale, timing_jitter_frac = self._domain_noise_scales(config.domain_profile_id)
+        A_run = self.A * a_scale
+        B_run = self.B * b_scale
 
         control_steps = self._control_period_steps(config)
         control_dt = control_steps * self.dt
         wheel_lsb = self._wheel_rate_lsb(config, control_dt)
-        L = self._build_kalman_gain(config, wheel_lsb)
+        cfg_meas = EpisodeConfig(**{**config.__dict__})
+        cfg_meas.imu_angle_noise_std_rad *= noise_scale
+        cfg_meas.imu_rate_noise_std_rad_s *= noise_scale
+        cfg_meas.wheel_encoder_rate_noise_std_rad_s *= noise_scale
+        L = self._build_kalman_gain(cfg_meas, wheel_lsb)
 
         queue_len = 1 if not config.hardware_realistic else max(int(config.control_delay_steps), 0) + 1
         cmd_queue = deque([np.zeros(3, dtype=float) for _ in range(queue_len)], maxlen=queue_len)
@@ -387,14 +431,21 @@ class ControllerEvaluator:
         legacy_family = family in ("legacy_wheel_pid", "legacy_wheel_lqr", "legacy_run_pd")
         paper_family = family == "paper_split_baseline"
         hybrid_family = family == "hybrid_modern"
+        mpc_family = family == "baseline_mpc"
+        robust_hinf_family = family == "baseline_robust_hinf_like"
 
         k_du = self._build_lqr_gain(params)
-        a_w = self.A[np.ix_([0, 2, 4], [0, 2, 4])]
-        b_w = self.B[np.ix_([0, 2, 4], [0])]
+        a_w = A_run[np.ix_([0, 2, 4], [0, 2, 4])]
+        b_w = B_run[np.ix_([0, 2, 4], [0])]
         q_w = np.diag([260.0, 35.0, 0.6])
         r_w = np.array([[0.08]])
         p_w = self._solve_discrete_are_robust(a_w, b_w, q_w, r_w, label="Paper pitch")
         k_paper_pitch = self._solve_linear_robust(b_w.T @ p_w @ b_w + r_w, b_w.T @ p_w @ a_w, label="Paper pitch K")
+        q_mpc = np.diag([120.0, 85.0, 50.0, 40.0, 1.0, 100.0, 100.0, 200.0, 200.0])
+        r_mpc = np.diag([0.35, 0.40, 0.40])
+        gram_mpc = B_run.T @ q_mpc @ B_run + r_mpc
+        rhs_mpc = B_run.T @ q_mpc @ A_run
+        k_mpc = self._solve_linear_robust(gram_mpc, rhs_mpc, label="MPC one-step K")
         max_du = np.array([params.max_du_rw, params.max_du_bx, params.max_du_by], dtype=float)
         tilt_fail_rad = min(math.radians(config.max_worst_tilt_deg), self.CRASH_ANGLE_RAD)
 
@@ -415,12 +466,20 @@ class ControllerEvaluator:
             )
 
             # Continuous predictor at simulation rate.
-            x_pred = self.A @ x_est + self.B @ u_eff_applied
+            x_pred = A_run @ x_est + B_run @ u_eff_applied
             x_est = x_pred
 
-            if step % control_steps == 0:
+            effective_control_steps = control_steps
+            if timing_jitter_frac > 0.0:
+                delta = 1 if rng.random() < timing_jitter_frac else 0
+                if rng.random() < 0.5:
+                    effective_control_steps = max(1, control_steps - delta)
+                else:
+                    effective_control_steps = control_steps + delta
+
+            if step % effective_control_steps == 0:
                 control_updates += 1
-                y = self._build_measurement(x_true, config, wheel_lsb, rng)
+                y = self._build_measurement(x_true, config, wheel_lsb, rng, noise_scale=noise_scale)
                 x_est = x_pred + L @ (y - self.C_MEAS @ x_pred)
                 # Base states are unobserved by C_MEAS; anchor to avoid estimator drift.
                 x_est[5] = x_true[5]
@@ -479,6 +538,18 @@ class ControllerEvaluator:
                 elif family == "legacy_run_pd":
                     u_rw_target = float(-(22.0 * x_est[0] + 6.0 * x_est[2]))
                     du_rw_cmd = float(u_rw_target - u_eff_applied[0])
+                elif mpc_family:
+                    u_target = -k_mpc @ x_ctrl
+                    du_rw_cmd = float(u_target[0] - u_eff_applied[0])
+                elif robust_hinf_family:
+                    robust_term = float(
+                        -0.40 * x_est[0]
+                        - 0.18 * x_est[2]
+                        - 0.08 * x_est[4]
+                        - 0.06 * x_est[1]
+                        - 0.03 * x_est[3]
+                    )
+                    du_rw_cmd = float(du_lqr[0] + robust_term - u_eff_applied[0] * 0.20)
                 else:
                     du_rw_cmd = float(du_lqr[0] - rw_damp_gain * x_est[4])
                     if hybrid_family:
@@ -605,6 +676,13 @@ class ControllerEvaluator:
                 if legacy_family:
                     base_target_x = 0.0
                     base_target_y = 0.0
+                if mpc_family:
+                    u_target = -k_mpc @ x_ctrl
+                    base_target_x = float(u_target[1])
+                    base_target_y = float(u_target[2])
+                if robust_hinf_family:
+                    base_target_x += float(-0.12 * x_est[7] - 0.06 * x_est[5] - 0.06 * x_est[1])
+                    base_target_y += float(-0.12 * x_est[8] - 0.06 * x_est[6] + 0.06 * x_est[0])
                 if low_spin_robust:
                     budget_speed = min(
                         self.WHEEL_SPIN_BUDGET_FRAC * self.MAX_WHEEL_SPEED_RAD_S,
@@ -764,9 +842,9 @@ class ControllerEvaluator:
             if step % config.disturbance_interval == 0:
                 force = np.array(
                     [
-                        rng.uniform(-config.disturbance_magnitude_xy, config.disturbance_magnitude_xy),
-                        rng.uniform(-config.disturbance_magnitude_xy, config.disturbance_magnitude_xy),
-                        rng.uniform(-config.disturbance_magnitude_z, config.disturbance_magnitude_z),
+                        rng.uniform(-config.disturbance_magnitude_xy, config.disturbance_magnitude_xy) * disturbance_scale,
+                        rng.uniform(-config.disturbance_magnitude_xy, config.disturbance_magnitude_xy) * disturbance_scale,
+                        rng.uniform(-config.disturbance_magnitude_z, config.disturbance_magnitude_z) * disturbance_scale,
                     ]
                 )
                 self.data.xfrc_applied[self.stick_body_id, :3] = force
@@ -807,6 +885,16 @@ class ControllerEvaluator:
             max_pitch = min(max_pitch, tilt_fail_rad)
             max_roll = min(max_roll, tilt_fail_rad)
         osc_band_energy = self._oscillation_band_energy(pitch_rate_series, roll_rate_series, vx_series, vy_series)
+        hw_consistency = 1.0
+        hw_traj_nrmse = np.nan
+        if config.hardware_replay and config.hardware_trace_path:
+            hw_consistency, hw_traj_nrmse = self._hardware_trace_consistency(
+                trace_path=config.hardware_trace_path,
+                pred_pitch_series=[float(v) for v in pitch_rate_series],
+                pred_roll_series=[float(v) for v in roll_rate_series],
+                pred_vx_series=[float(v) for v in vx_series],
+                pred_vy_series=[float(v) for v in vy_series],
+            )
         return {
             "survived": 1.0 if crash_step is None else 0.0,
             "crash_count": 0.0 if crash_step is None else 1.0,
@@ -828,6 +916,8 @@ class ControllerEvaluator:
             "wheel_over_budget": float(wheel_over_budget_count),
             "wheel_over_hard": float(wheel_over_hard_count),
             "high_spin_active_ratio": float(high_spin_steps / max(steps_run, 1)),
+            "sim_real_consistency": float(hw_consistency),
+            "sim_real_traj_nrmse": float(hw_traj_nrmse),
         }
 
     def evaluate_candidate(
@@ -858,9 +948,14 @@ class ControllerEvaluator:
         wheel_over_budget_mean = float(np.mean([m["wheel_over_budget"] for m in per_episode]))
         wheel_over_hard_mean = float(np.mean([m["wheel_over_hard"] for m in per_episode]))
         high_spin_active_ratio_mean = float(np.mean([m.get("high_spin_active_ratio", 0.0) for m in per_episode]))
+        sim_real_consistency_mean = float(np.mean([m.get("sim_real_consistency", 0.0) for m in per_episode]))
+        sim_real_vals = np.asarray([m.get("sim_real_traj_nrmse", np.nan) for m in per_episode], dtype=float)
+        sim_real_traj_nrmse_mean = float(np.nanmean(sim_real_vals)) if np.any(np.isfinite(sim_real_vals)) else np.nan
         crash_count_total = float(np.sum([m["crash_count"] for m in per_episode]))
         crash_rate = 1.0 - survival_rate
         score_composite = float(np.mean(episode_score_list))
+        score_p5 = float(np.quantile(np.asarray(episode_score_list, dtype=float), 0.05)) if episode_score_list else np.nan
+        score_p1 = float(np.quantile(np.asarray(episode_score_list, dtype=float), 0.01)) if episode_score_list else np.nan
 
         crash_steps = [m["crash_step"] for m in per_episode if not np.isnan(m["crash_step"])]
         worst_crash_step = float(np.min(crash_steps)) if crash_steps else np.nan
@@ -883,11 +978,21 @@ class ControllerEvaluator:
             failure_tags.append("gate_sat_du")
         if not ok_sat_abs:
             failure_tags.append("gate_sat_abs")
+        if config.hardware_replay and sim_real_consistency_mean < 0.55:
+            failure_tags.append("gate_sim_real")
         failure_reason = "+".join(failure_tags)
+        if accepted_gate and score_composite >= 90.0:
+            confidence_tier = "best_in_class_candidate"
+        elif accepted_gate and score_composite >= 75.0:
+            confidence_tier = "strong"
+        else:
+            confidence_tier = "exploratory"
 
         return {
             "survival_rate": survival_rate,
             "score_composite": score_composite,
+            "score_p5": score_p5,
+            "score_p1": score_p1,
             "episode_score_list": [float(v) for v in episode_score_list],
             "accepted_gate": accepted_gate,
             "worst_crash_step": worst_crash_step,
@@ -908,15 +1013,21 @@ class ControllerEvaluator:
             "wheel_over_budget_mean": wheel_over_budget_mean,
             "wheel_over_hard_mean": wheel_over_hard_mean,
             "high_spin_active_ratio_mean": high_spin_active_ratio_mean,
+            "sim_real_consistency_mean": sim_real_consistency_mean,
+            "sim_real_traj_nrmse_mean": sim_real_traj_nrmse_mean,
             "crash_count_total": crash_count_total,
             "crash_rate": crash_rate,
             "failure_reason": failure_reason,
+            "confidence_tier": confidence_tier,
             "hardware_realistic": bool(config.hardware_realistic),
             "control_hz": float(config.control_hz),
             "control_delay_steps": int(config.control_delay_steps),
             "preset": str(config.preset),
             "stability_profile": str(config.stability_profile),
             "controller_family": str(config.controller_family),
+            "model_variant_id": str(config.model_variant_id),
+            "domain_profile_id": str(config.domain_profile_id),
+            "hardware_replay": bool(config.hardware_replay),
         }
 
     def _oscillation_band_energy(
@@ -944,6 +1055,62 @@ class ControllerEvaluator:
         by = band_power(np.asarray(vy))
         return p + r + 0.25 * bx + 0.25 * by
 
+    def _hardware_trace_consistency(
+        self,
+        trace_path: str,
+        pred_pitch_series: List[float],
+        pred_roll_series: List[float],
+        pred_vx_series: List[float],
+        pred_vy_series: List[float],
+    ) -> tuple[float, float]:
+        path = Path(trace_path)
+        if (not path.exists()) or (not path.is_file()):
+            return 0.0, np.nan
+        obs_pitch = []
+        obs_roll = []
+        obs_vx = []
+        obs_vy = []
+        try:
+            with path.open("r", encoding="utf-8", newline="") as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    obs_pitch.append(float(row.get("pitch_rate", "nan")))
+                    obs_roll.append(float(row.get("roll_rate", "nan")))
+                    obs_vx.append(float(row.get("base_vx", "nan")))
+                    obs_vy.append(float(row.get("base_vy", "nan")))
+        except Exception:
+            return 0.0, np.nan
+
+        n = min(len(obs_pitch), len(pred_pitch_series), len(pred_roll_series), len(pred_vx_series), len(pred_vy_series))
+        if n < 16:
+            return 0.0, np.nan
+        obs = np.vstack(
+            [
+                np.asarray(obs_pitch[:n], dtype=float),
+                np.asarray(obs_roll[:n], dtype=float),
+                np.asarray(obs_vx[:n], dtype=float),
+                np.asarray(obs_vy[:n], dtype=float),
+            ]
+        )
+        pred = np.vstack(
+            [
+                np.asarray(pred_pitch_series[:n], dtype=float),
+                np.asarray(pred_roll_series[:n], dtype=float),
+                np.asarray(pred_vx_series[:n], dtype=float),
+                np.asarray(pred_vy_series[:n], dtype=float),
+            ]
+        )
+        finite = np.all(np.isfinite(obs), axis=0) & np.all(np.isfinite(pred), axis=0)
+        if np.count_nonzero(finite) < 16:
+            return 0.0, np.nan
+        obs = obs[:, finite]
+        pred = pred[:, finite]
+        mse = float(np.mean((pred - obs) ** 2))
+        var = float(np.var(obs))
+        nrmse = float(np.sqrt(mse / max(var, 1e-9)))
+        consistency = float(np.clip(1.0 - nrmse, 0.0, 1.0))
+        return consistency, nrmse
+
 
 def safe_evaluate_candidate(
     evaluator: ControllerEvaluator,
@@ -957,6 +1124,8 @@ def safe_evaluate_candidate(
         return {
             "survival_rate": 0.0,
             "score_composite": -1e9,
+            "score_p5": -1e9,
+            "score_p1": -1e9,
             "episode_score_list": [],
             "crash_rate": 1.0,
             "crash_count_total": float(len(episode_seeds)),
@@ -979,11 +1148,17 @@ def safe_evaluate_candidate(
             "wheel_over_budget_mean": 0.0,
             "wheel_over_hard_mean": 0.0,
             "high_spin_active_ratio_mean": 0.0,
+            "sim_real_consistency_mean": 0.0,
+            "sim_real_traj_nrmse_mean": np.nan,
             "failure_reason": "riccati_failure",
+            "confidence_tier": "exploratory",
             "hardware_realistic": bool(config.hardware_realistic),
             "control_hz": float(config.control_hz),
             "control_delay_steps": int(config.control_delay_steps),
             "preset": str(config.preset),
             "stability_profile": str(config.stability_profile),
             "controller_family": str(config.controller_family),
+            "model_variant_id": str(config.model_variant_id),
+            "domain_profile_id": str(config.domain_profile_id),
+            "hardware_replay": bool(config.hardware_replay),
         }
