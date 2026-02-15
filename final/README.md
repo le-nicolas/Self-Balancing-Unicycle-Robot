@@ -316,6 +316,18 @@ Simulation protocol highlights:
 - periodic disturbances
 - multi-family comparator framework and reproducible artifacts
 
+### Statistical visual graph (paper context vs simulation)
+
+![Paper vs simulation statistical comparison](results/paper_vs_sim_comparison.png)
+
+Graph inputs:
+- CSV: `final/results/benchmark_20260216_011044.csv`
+- Plot script: `final/plot_paper_vs_sim.py`
+- Re-generate:
+```bash
+python final/plot_paper_vs_sim.py --csv final/results/benchmark_20260216_011044.csv --out final/results/paper_vs_sim_comparison.png
+```
+
 ### Nuanced claim boundary
 
 Reasonable claim:

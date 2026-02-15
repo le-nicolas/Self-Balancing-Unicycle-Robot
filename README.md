@@ -61,6 +61,29 @@ Canonical source:
 | `paper_split_baseline` | 1.000 | 0.000 | 72.913 |
 | `baseline_mpc` | 0.625 | 0.375 | 37.837 |
 
+## 2013 Paper Context and Statistical Visual Comparison
+
+Reference paper (hardware implementation):
+- J. Lee, S. Han, J. Lee, "Decoupled Dynamic Control for Pitch and Roll Axes of the Unicycle Robot," IEEE Transactions on Industrial Electronics, Vol. 60, No. 9, September 2013.
+- DOI: `10.1109/TIE.2012.2208431`
+- Local review source: `C:/Users/User/Downloads/onebot.pdf`
+
+Comparison intent:
+- Reproduce balancing objectives in simulation and extend evaluation rigor under explicit noise, delay, disturbances, comparator families, and repeatable artifacts.
+- Preserve nuance: this is not a strict apples-to-apples hardware replacement claim.
+
+Statistical visual summary (paper context vs this simulation benchmark):
+
+![Paper vs simulation statistical comparison](final/results/paper_vs_sim_comparison.png)
+
+Figure source and generator:
+- CSV: `final/results/benchmark_20260216_011044.csv`
+- Script: `final/plot_paper_vs_sim.py`
+- Re-generate:
+```bash
+python final/plot_paper_vs_sim.py --csv final/results/benchmark_20260216_011044.csv --out final/results/paper_vs_sim_comparison.png
+```
+
 ## Reproducibility
 
 Benchmark command used for the snapshot:
