@@ -199,12 +199,22 @@ Release campaign:
 python final/benchmark.py --release-campaign --multiple-comparison-correction holm
 ```
 
+Strict simulation hardware-readiness gate:
+
+```bash
+python final/benchmark.py --release-campaign --readiness-report --readiness-sign-window-steps 25 --readiness-replay-min-consistency 0.60 --readiness-replay-max-nrmse 0.75
+```
+
 Optional hardware replay:
 
 ```bash
 python final/benchmark.py --benchmark-profile nightly_long --hardware-trace-path path/to/hardware_trace.csv
 python final/final.py --mode smooth --trace-events-csv final/results/runtime_trace.csv
 ```
+
+Readiness outputs:
+- `final/results/readiness_<timestamp>.json`
+- `final/results/readiness_<timestamp>.md`
 
 ## 11) Known Limits
 

@@ -1,4 +1,5 @@
 from pathlib import Path
+import csv
 
 import numpy as np
 
@@ -111,3 +112,47 @@ def test_family_dispatch_finite_metrics():
         out = safe_evaluate_candidate(ev, _baseline_params(), [123], cfg)
         assert np.isfinite(float(out["score_composite"]))
         assert np.isfinite(float(out["survival_rate"]))
+
+
+def test_sign_sanity_analyzer_with_synthetic_trace(tmp_path: Path):
+    trace = tmp_path / "runtime_trace.csv"
+    with trace.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(
+            f,
+            fieldnames=["pitch", "wheel_rate", "u_rw"],
+        )
+        writer.writeheader()
+        # Mostly correct: u_rw opposes pitch and wheel_rate.
+        for _ in range(40):
+            writer.writerow({"pitch": 0.02, "wheel_rate": 50.0, "u_rw": -1.0})
+    out = benchmark.analyze_sign_sanity(trace, window_steps=20)
+    assert bool(out["trace_found"]) is True
+    assert bool(out["readiness_sign_sanity_pass"]) is True
+
+
+def test_readiness_strict_fails_without_replay_or_trace():
+    row = {
+        "survival_rate": 1.0,
+        "accepted_gate": True,
+        "failure_reason": "",
+        "wheel_over_hard_mean": 0.0,
+        "mean_sat_rate_abs": 0.1,
+        "score_p5": 10.0,
+        "score_p1": 5.0,
+        "mean_command_jerk": 1.0,
+        "control_hz": 250.0,
+        "control_delay_steps": 1,
+        "sim_real_consistency_mean": np.nan,
+        "sim_real_traj_nrmse_mean": np.nan,
+    }
+    benchmark.apply_readiness_to_row(
+        row,
+        strict=True,
+        require_replay=True,
+        replay_min_consistency=0.6,
+        replay_max_nrmse=0.75,
+        sign_sanity_pass=False,
+        sign_trace_found=False,
+    )
+    assert bool(row["readiness_overall_pass"]) is False
+    assert "readiness_replay" in str(row["readiness_failure_reasons"])

@@ -227,12 +227,22 @@ Release campaign (protocol-locked, cross-variant/domain, corrected significance)
 python final/benchmark.py --release-campaign --multiple-comparison-correction holm --model-variants nominal,inertia_plus,friction_low,com_shift --domain-rand-profile default,rand_light,rand_medium
 ```
 
+Strict simulation hardware-readiness gate (JSON + Markdown):
+
+```bash
+python final/benchmark.py --release-campaign --readiness-report --readiness-sign-window-steps 25 --readiness-replay-min-consistency 0.60 --readiness-replay-max-nrmse 0.75
+```
+
 Hardware replay alignment (optional):
 
 ```bash
 python final/benchmark.py --benchmark-profile nightly_long --hardware-trace-path path/to/hardware_trace.csv
 python final/final.py --mode smooth --trace-events-csv final/results/runtime_trace.csv
 ```
+
+Readiness artifacts are emitted under `final/results/` as:
+- `readiness_<timestamp>.json`
+- `readiness_<timestamp>.md`
 
 ## Known Limitations
 

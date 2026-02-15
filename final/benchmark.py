@@ -55,6 +55,30 @@ def parse_args():
         default="holm",
     )
     parser.add_argument("--hardware-trace-path", type=str, default=None)
+    parser.add_argument(
+        "--readiness-report",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Emit strict simulation hardware-readiness report artifacts.",
+    )
+    parser.add_argument(
+        "--readiness-sign-window-steps",
+        type=int,
+        default=25,
+        help="Minimum consecutive sample window for sign-sanity checks.",
+    )
+    parser.add_argument(
+        "--readiness-replay-min-consistency",
+        type=float,
+        default=0.60,
+        help="Minimum sim/real consistency score for replay readiness pass.",
+    )
+    parser.add_argument(
+        "--readiness-replay-max-nrmse",
+        type=float,
+        default=0.75,
+        help="Maximum sim/real trajectory NRMSE for replay readiness pass.",
+    )
     parser.add_argument("--episodes", type=int, default=None)
     parser.add_argument("--trials", type=int, default=None)
     parser.add_argument("--outdir", type=str, default="final/results")
@@ -92,6 +116,11 @@ def parse_args():
 def parse_csv_list(raw: str) -> List[str]:
     vals = [v.strip() for v in str(raw).split(",") if v.strip()]
     return vals
+
+
+def discover_trace_events_csv(outdir: Path) -> Path | None:
+    candidates = sorted(outdir.glob("runtime_trace*.csv"), key=lambda p: p.stat().st_mtime, reverse=True)
+    return candidates[0] if candidates else None
 
 
 def apply_stress_defaults(args):
@@ -212,6 +241,211 @@ def validate_row_metrics(row: Dict[str, object]) -> None:
         if not np.isfinite(v):
             row["failure_reason"] = str(row.get("failure_reason", "")) + ("+" if row.get("failure_reason") else "") + "metric_nonfinite"
             row["accepted_gate"] = False
+
+
+def analyze_sign_sanity(trace_events_csv: Path | None, window_steps: int) -> Dict[str, object]:
+    result = {
+        "trace_found": False,
+        "tilt_correction_samples": 0,
+        "tilt_wrong_sign_samples": 0,
+        "despin_samples": 0,
+        "despin_wrong_sign_samples": 0,
+        "readiness_sign_sanity_pass": False,
+    }
+    if trace_events_csv is None or (not trace_events_csv.exists()):
+        return result
+    result["trace_found"] = True
+    rows = []
+    with trace_events_csv.open("r", encoding="utf-8", newline="") as f:
+        reader = csv.DictReader(f)
+        for r in reader:
+            rows.append(r)
+    if not rows:
+        return result
+    tilt_samples = 0
+    tilt_wrong = 0
+    despin_samples = 0
+    despin_wrong = 0
+    for r in rows:
+        try:
+            pitch = float(r.get("pitch", "nan"))
+            wheel_rate = float(r.get("wheel_rate", "nan"))
+            u_rw = float(r.get("u_rw", "nan"))
+        except Exception:
+            continue
+        if not (np.isfinite(pitch) and np.isfinite(wheel_rate) and np.isfinite(u_rw)):
+            continue
+        if abs(pitch) > np.radians(0.7):
+            tilt_samples += 1
+            if np.sign(u_rw) == np.sign(pitch):
+                tilt_wrong += 1
+        if abs(wheel_rate) > 30.0 and abs(pitch) < np.radians(2.0):
+            despin_samples += 1
+            if np.sign(u_rw) == np.sign(wheel_rate):
+                despin_wrong += 1
+    result["tilt_correction_samples"] = tilt_samples
+    result["tilt_wrong_sign_samples"] = tilt_wrong
+    result["despin_samples"] = despin_samples
+    result["despin_wrong_sign_samples"] = despin_wrong
+    enough = (tilt_samples >= max(window_steps, 1)) and (despin_samples >= max(window_steps, 1))
+    if enough:
+        tilt_bad_rate = tilt_wrong / max(tilt_samples, 1)
+        despin_bad_rate = despin_wrong / max(despin_samples, 1)
+        result["readiness_sign_sanity_pass"] = bool(tilt_bad_rate <= 0.20 and despin_bad_rate <= 0.20)
+    return result
+
+
+def deterministic_rerun_check(
+    evaluator: ControllerEvaluator,
+    params: CandidateParams,
+    episode_seeds: List[int],
+    config: EpisodeConfig,
+    tol: float = 1e-9,
+) -> Dict[str, object]:
+    m1 = safe_evaluate_candidate(evaluator, params, episode_seeds, config)
+    m2 = safe_evaluate_candidate(evaluator, params, episode_seeds, config)
+    d_score = abs(float(m1.get("score_composite", np.nan)) - float(m2.get("score_composite", np.nan)))
+    d_survival = abs(float(m1.get("survival_rate", np.nan)) - float(m2.get("survival_rate", np.nan)))
+    passed = bool(np.isfinite(d_score) and np.isfinite(d_survival) and d_score <= tol and d_survival <= tol)
+    return {
+        "deterministic_rerun_pass": passed,
+        "delta_score_composite": float(d_score) if np.isfinite(d_score) else np.nan,
+        "delta_survival_rate": float(d_survival) if np.isfinite(d_survival) else np.nan,
+        "tolerance": float(tol),
+    }
+
+
+def apply_readiness_to_row(
+    row: Dict[str, object],
+    *,
+    strict: bool,
+    require_replay: bool,
+    replay_min_consistency: float,
+    replay_max_nrmse: float,
+    sign_sanity_pass: bool,
+    sign_trace_found: bool,
+) -> None:
+    failure = str(row.get("failure_reason", ""))
+    safety_pass = bool(
+        float(row.get("survival_rate", 0.0)) >= 1.0 - 1e-12
+        and bool(row.get("accepted_gate", False))
+        and ("gate_" not in failure)
+    )
+    electrical_proxy_pass = bool(
+        float(row.get("wheel_over_hard_mean", 0.0)) <= 1e-9
+        and float(row.get("mean_sat_rate_abs", 1.0)) <= 0.90
+    )
+    sensing_pass = bool(
+        np.isfinite(float(row.get("score_p5", np.nan)))
+        and np.isfinite(float(row.get("score_p1", np.nan)))
+        and ("riccati_failure" not in failure)
+    )
+    timing_pass = bool(
+        np.isfinite(float(row.get("mean_command_jerk", np.nan)))
+        and np.isfinite(float(row.get("control_hz", np.nan)))
+        and int(row.get("control_delay_steps", 0)) >= 0
+    )
+    replay_has_metrics = np.isfinite(float(row.get("sim_real_consistency_mean", np.nan))) and (
+        np.isfinite(float(row.get("sim_real_traj_nrmse_mean", np.nan)))
+    )
+    replay_pass = bool(
+        replay_has_metrics
+        and float(row.get("sim_real_consistency_mean", 0.0)) >= replay_min_consistency
+        and float(row.get("sim_real_traj_nrmse_mean", np.inf)) <= replay_max_nrmse
+    )
+    sign_pass = bool(sign_sanity_pass and sign_trace_found)
+
+    if not require_replay and (not replay_has_metrics):
+        replay_pass = True
+    if not strict and (not sign_trace_found):
+        sign_pass = True
+
+    reasons = []
+    if not safety_pass:
+        reasons.append("readiness_safety")
+    if not electrical_proxy_pass:
+        reasons.append("readiness_electrical_proxy")
+    if not sensing_pass:
+        reasons.append("readiness_sensing")
+    if not timing_pass:
+        reasons.append("readiness_timing")
+    if not sign_pass:
+        reasons.append("readiness_sign_sanity")
+    if not replay_pass:
+        reasons.append("readiness_replay")
+
+    overall = bool(safety_pass and electrical_proxy_pass and sensing_pass and timing_pass and sign_pass and replay_pass)
+    if strict:
+        overall = bool(overall and len(reasons) == 0)
+
+    row["readiness_safety_pass"] = safety_pass
+    row["readiness_electrical_proxy_pass"] = electrical_proxy_pass
+    row["readiness_sensing_pass"] = sensing_pass
+    row["readiness_timing_pass"] = timing_pass
+    row["readiness_sign_sanity_pass"] = sign_pass
+    row["readiness_replay_pass"] = replay_pass
+    row["readiness_overall_pass"] = overall
+    row["readiness_failure_reasons"] = ",".join(reasons)
+
+
+def write_readiness_reports(
+    *,
+    outdir: Path,
+    ts: str,
+    rows: List[Dict[str, object]],
+    protocol_manifest: Dict[str, object],
+    deterministic_check: Dict[str, object],
+    sign_summary: Dict[str, object],
+    command_line: str,
+) -> tuple[Path, Path]:
+    json_path = outdir / f"readiness_{ts}.json"
+    md_path = outdir / f"readiness_{ts}.md"
+
+    overall_pass = bool(all(bool(r.get("readiness_overall_pass", False)) for r in rows if not bool(r.get("is_baseline", False))))
+    payload = {
+        "schema_version": PROTOCOL_SCHEMA_VERSION,
+        "timestamp": ts,
+        "overall_pass": overall_pass,
+        "deterministic_check": deterministic_check,
+        "sign_summary": sign_summary,
+        "protocol_manifest": protocol_manifest,
+        "rows": [
+            {
+                "run_id": r.get("run_id"),
+                "mode_id": r.get("mode_id"),
+                "controller_family": r.get("controller_family"),
+                "model_variant_id": r.get("model_variant_id"),
+                "domain_profile_id": r.get("domain_profile_id"),
+                "promotion_pass": r.get("promotion_pass"),
+                "release_verdict": r.get("release_verdict"),
+                "readiness_overall_pass": r.get("readiness_overall_pass"),
+                "readiness_failure_reasons": r.get("readiness_failure_reasons", ""),
+            }
+            for r in rows
+        ],
+    }
+    json_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+    lines = []
+    lines.append("# Simulation Hardware-Readiness Report")
+    lines.append("")
+    lines.append(f"- Overall pass: `{overall_pass}`")
+    lines.append(f"- Deterministic rerun pass: `{deterministic_check.get('deterministic_rerun_pass', False)}`")
+    lines.append(f"- Sign trace found: `{sign_summary.get('trace_found', False)}`")
+    lines.append("")
+    lines.append("| Mode | Family | Variant | Domain | Ready | Reasons |")
+    lines.append("|---|---|---|---|---|---|")
+    for r in rows:
+        lines.append(
+            f"| {r.get('mode_id')} | {r.get('controller_family')} | {r.get('model_variant_id')} | {r.get('domain_profile_id')} | {r.get('readiness_overall_pass')} | {r.get('readiness_failure_reasons','')} |"
+        )
+    lines.append("")
+    lines.append("## Repro Command")
+    lines.append("```bash")
+    lines.append(command_line)
+    lines.append("```")
+    md_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return json_path, md_path
 
 
 def get_mode_matrix(compare_modes: str):
@@ -393,6 +627,14 @@ def make_row(
         "significance_ci_high": np.nan,
         "promotion_pass": False,
         "release_verdict": False,
+        "readiness_safety_pass": False,
+        "readiness_electrical_proxy_pass": False,
+        "readiness_sensing_pass": False,
+        "readiness_timing_pass": False,
+        "readiness_sign_sanity_pass": False,
+        "readiness_replay_pass": False,
+        "readiness_overall_pass": False,
+        "readiness_failure_reasons": "",
         "_episode_scores": episode_scores,
     }
 
@@ -710,6 +952,8 @@ def print_report(rows: List[Dict[str, object]], primary_objective: str):
 
 def main():
     args = parse_args()
+    if args.readiness_report is None:
+        args.readiness_report = bool(args.release_campaign)
     if args.release_campaign:
         args.benchmark_profile = "nightly_long"
         if args.trials is None:
@@ -740,6 +984,39 @@ def main():
 
     rng = np.random.default_rng(args.seed)
     episode_seeds = [int(s) for s in rng.integers(0, 2**31 - 1, size=episodes)]
+    canonical_mode = mode_matrix[0]
+    deterministic_cfg = EpisodeConfig(
+        steps=max(128, min(steps, 512)),
+        disturbance_magnitude_xy=args.disturbance_xy,
+        disturbance_magnitude_z=args.disturbance_z,
+        disturbance_interval=args.disturbance_interval,
+        init_angle_deg=args.init_angle_deg,
+        init_base_pos_m=args.init_base_pos_m,
+        max_worst_tilt_deg=args.gate_max_worst_tilt,
+        max_worst_base_m=args.gate_max_worst_base,
+        max_mean_sat_rate_du=args.gate_max_sat_du,
+        max_mean_sat_rate_abs=args.gate_max_sat_abs,
+        control_hz=args.control_hz,
+        control_delay_steps=args.control_delay_steps,
+        hardware_realistic=not args.legacy_model,
+        imu_angle_noise_std_rad=float(np.radians(args.imu_angle_noise_deg)),
+        imu_rate_noise_std_rad_s=args.imu_rate_noise,
+        wheel_encoder_ticks_per_rev=args.wheel_encoder_ticks,
+        wheel_encoder_rate_noise_std_rad_s=args.wheel_rate_noise,
+        preset=str(canonical_mode[1]),
+        stability_profile=str(canonical_mode[2]),
+        controller_family="current",
+        model_variant_id="nominal",
+        domain_profile_id="default",
+        hardware_replay=bool(args.hardware_trace_path),
+        hardware_trace_path=args.hardware_trace_path,
+    )
+    deterministic_check = deterministic_rerun_check(
+        evaluator=evaluator,
+        params=baseline_candidate(),
+        episode_seeds=episode_seeds[: min(len(episode_seeds), 6)],
+        config=deterministic_cfg,
+    )
     rows: List[Dict[str, object]] = []
     seen_candidate_vecs: List[np.ndarray] = []
     novelty_rejects = 0
@@ -942,6 +1219,23 @@ def main():
             )
             row["release_verdict"] = bool(row["promotion_pass"] and str(row.get("confidence_tier", "")) in ("strong", "best_in_class_candidate"))
 
+    trace_events_csv = discover_trace_events_csv(outdir)
+    sign_summary = analyze_sign_sanity(trace_events_csv, args.readiness_sign_window_steps)
+    for row in rows:
+        apply_readiness_to_row(
+            row,
+            strict=True,
+            require_replay=bool(args.release_campaign),
+            replay_min_consistency=float(args.readiness_replay_min_consistency),
+            replay_max_nrmse=float(args.readiness_replay_max_nrmse),
+            sign_sanity_pass=bool(sign_summary.get("readiness_sign_sanity_pass", False)),
+            sign_trace_found=bool(sign_summary.get("trace_found", False)),
+        )
+        row["release_verdict"] = bool(
+            bool(row.get("release_verdict", False))
+            and bool(row.get("readiness_overall_pass", False))
+        )
+
     # Domain robustness stratification.
     for row in rows:
         family_rows = [
@@ -965,6 +1259,8 @@ def main():
     summary_path = outdir / f"benchmark_{ts}_summary.txt"
     manifest_path = outdir / f"benchmark_{ts}_protocol.json"
     release_path = outdir / f"benchmark_{ts}_release_bundle.json"
+    readiness_json_path = outdir / f"readiness_{ts}.json"
+    readiness_md_path = outdir / f"readiness_{ts}.md"
     write_csv(csv_path, ranked)
     baseline_for_plot = next((r for r in ranked if bool(r["is_baseline"])), ranked[0])
     maybe_plot(plot_path, ranked, baseline_for_plot)
@@ -983,6 +1279,9 @@ def main():
         "release_campaign": bool(args.release_campaign),
         "promotion_pass_count": int(sum(1 for r in ranked if bool(r.get("promotion_pass", False)))),
         "release_verdict_count": int(sum(1 for r in ranked if bool(r.get("release_verdict", False)))),
+        "readiness_overall_pass_count": int(sum(1 for r in ranked if bool(r.get("readiness_overall_pass", False)))),
+        "deterministic_check": deterministic_check,
+        "sign_summary": sign_summary,
         "top_rows": [
             {
                 "run_id": r.get("run_id"),
@@ -994,6 +1293,8 @@ def main():
                 "survival_rate": r.get("survival_rate"),
                 "promotion_pass": r.get("promotion_pass"),
                 "release_verdict": r.get("release_verdict"),
+                "readiness_overall_pass": r.get("readiness_overall_pass"),
+                "readiness_failure_reasons": r.get("readiness_failure_reasons"),
                 "confidence_tier": r.get("confidence_tier"),
             }
             for r in ranked[:20]
@@ -1003,9 +1304,22 @@ def main():
             "plot": str(plot_path),
             "summary": str(summary_path),
             "protocol_manifest": str(manifest_path),
+            "readiness_json": str(readiness_json_path),
+            "readiness_md": str(readiness_md_path),
         },
     }
     release_path.write_text(json.dumps(release_bundle, indent=2), encoding="utf-8")
+    if bool(args.readiness_report):
+        cmdline = "python final/benchmark.py " + " ".join(__import__("sys").argv[1:])
+        readiness_json_path, readiness_md_path = write_readiness_reports(
+            outdir=outdir,
+            ts=ts,
+            rows=ranked,
+            protocol_manifest=protocol_manifest,
+            deterministic_check=deterministic_check,
+            sign_summary=sign_summary,
+            command_line=cmdline,
+        )
 
     print("\n=== ARTIFACTS ===")
     print(f"CSV: {csv_path}")
@@ -1013,6 +1327,9 @@ def main():
     print(f"Summary: {summary_path}")
     print(f"Protocol: {manifest_path}")
     print(f"Release bundle: {release_path}")
+    if bool(args.readiness_report):
+        print(f"Readiness JSON: {readiness_json_path}")
+        print(f"Readiness MD: {readiness_md_path}")
 
 
 if __name__ == "__main__":
