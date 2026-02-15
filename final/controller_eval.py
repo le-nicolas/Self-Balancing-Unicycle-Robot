@@ -8,6 +8,7 @@ from typing import Dict, List, Optional
 import mujoco
 import numpy as np
 from scipy.linalg import LinAlgError, solve_discrete_are
+import runtime_config as runtime_cfg
 
 
 @dataclass
@@ -40,6 +41,7 @@ class EpisodeConfig:
     max_worst_base_m: float = 4.0
     max_mean_sat_rate_du: float = 0.98
     max_mean_sat_rate_abs: float = 0.90
+    mode: str = "smooth"
     control_hz: float = 250.0
     control_delay_steps: int = 1
     hardware_realistic: bool = True
@@ -112,18 +114,6 @@ class ControllerEvaluator:
     HOLD_WHEEL_DESPIN_SCALE = 1.0
     UPRIGHT_BLEND_RISE = 0.10
     UPRIGHT_BLEND_FALL = 0.28
-    # C maps full state to measured channels [pitch, roll, pitch_rate, roll_rate, wheel_rate].
-    C_MEAS = np.array(
-        [
-            [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
-            [0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
-            [0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
-            [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0],
-            [0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0],
-        ],
-        dtype=float,
-    )
-
     @staticmethod
     def _fuzzy_roll_gain(roll: float, roll_rate: float, angle_scale: float, rate_scale: float) -> float:
         roll_n = abs(roll) / max(angle_scale, 1e-6)
@@ -212,11 +202,117 @@ class ControllerEvaluator:
         self.data = mujoco.MjData(self.model)
         self.dt = self.model.opt.timestep
 
+        self._runtime_cfg_cache: dict[tuple[object, ...], runtime_cfg.RuntimeConfig] = {}
+        self._sync_runtime_tuning(self._resolve_runtime_cfg(EpisodeConfig()))
         self._resolve_ids()
         self.A, self.B = self._linearize()
         self.NX = self.A.shape[0]
         self.NU = self.B.shape[1]
         self._validate_xml_ctrlrange()
+
+    def _resolve_runtime_cfg(self, config: EpisodeConfig) -> runtime_cfg.RuntimeConfig:
+        key = (
+            str(config.mode),
+            str(config.preset),
+            str(config.stability_profile),
+            bool(config.hardware_realistic),
+            float(config.control_hz),
+            int(config.control_delay_steps),
+            int(config.wheel_encoder_ticks_per_rev),
+            round(float(config.imu_angle_noise_std_rad), 12),
+            round(float(config.imu_rate_noise_std_rad_s), 12),
+            round(float(config.wheel_encoder_rate_noise_std_rad_s), 12),
+            str(config.controller_family),
+        )
+        cached = self._runtime_cfg_cache.get(key)
+        if cached is not None:
+            return cached
+
+        argv = [
+            "--mode",
+            str(config.mode),
+            "--preset",
+            str(config.preset),
+            "--stability-profile",
+            str(config.stability_profile),
+            "--control-hz",
+            f"{float(config.control_hz)}",
+            "--control-delay-steps",
+            str(int(config.control_delay_steps)),
+            "--wheel-encoder-ticks",
+            str(int(config.wheel_encoder_ticks_per_rev)),
+            "--imu-angle-noise-deg",
+            f"{float(np.degrees(config.imu_angle_noise_std_rad))}",
+            "--imu-rate-noise",
+            f"{float(config.imu_rate_noise_std_rad_s)}",
+            "--wheel-rate-noise",
+            f"{float(config.wheel_encoder_rate_noise_std_rad_s)}",
+            "--controller-family",
+            (
+                str(config.controller_family)
+                if str(config.controller_family) in {"current", "hybrid_modern", "paper_split_baseline"}
+                else "current"
+            ),
+        ]
+        if not config.hardware_realistic:
+            argv.append("--legacy-model")
+
+        parsed = runtime_cfg.parse_args(argv)
+        resolved = runtime_cfg.build_config(parsed)
+        self._runtime_cfg_cache[key] = resolved
+        return resolved
+
+    def _sync_runtime_tuning(self, cfg: runtime_cfg.RuntimeConfig) -> None:
+        self.X_REF = float(cfg.x_ref)
+        self.Y_REF = float(cfg.y_ref)
+        self.INT_CLAMP = float(cfg.int_clamp)
+        self.UPRIGHT_ANGLE_THRESH = float(cfg.upright_angle_thresh)
+        self.UPRIGHT_VEL_THRESH = float(cfg.upright_vel_thresh)
+        self.UPRIGHT_POS_THRESH = float(cfg.upright_pos_thresh)
+        self.CRASH_ANGLE_RAD = float(cfg.crash_angle_rad)
+        self.MAX_U = np.asarray(cfg.max_u, dtype=float).copy()
+        self.MAX_WHEEL_SPEED_RAD_S = float(cfg.max_wheel_speed_rad_s)
+        self.MAX_BASE_SPEED_M_S = float(cfg.max_base_speed_m_s)
+        self.WHEEL_TORQUE_DERATE_START = float(cfg.wheel_torque_derate_start)
+        self.BASE_TORQUE_DERATE_START = float(cfg.base_torque_derate_start)
+        self.BASE_FORCE_SOFT_LIMIT = float(cfg.base_force_soft_limit)
+        self.BASE_DAMPING_GAIN = float(cfg.base_damping_gain)
+        self.BASE_CENTERING_GAIN = float(cfg.base_centering_gain)
+        self.BASE_TILT_DEADBAND_RAD = float(cfg.base_tilt_deadband_rad)
+        self.BASE_TILT_FULL_AUTHORITY_RAD = float(cfg.base_tilt_full_authority_rad)
+        self.BASE_COMMAND_GAIN = float(cfg.base_command_gain)
+        self.BASE_CENTERING_POS_CLIP_M = float(cfg.base_centering_pos_clip_m)
+        self.BASE_SPEED_SOFT_LIMIT_FRAC = float(cfg.base_speed_soft_limit_frac)
+        self.BASE_HOLD_RADIUS_M = float(cfg.base_hold_radius_m)
+        self.BASE_REF_FOLLOW_RATE_HZ = float(cfg.base_ref_follow_rate_hz)
+        self.BASE_REF_RECENTER_RATE_HZ = float(cfg.base_ref_recenter_rate_hz)
+        self.BASE_PITCH_KP = float(cfg.base_pitch_kp)
+        self.BASE_PITCH_KD = float(cfg.base_pitch_kd)
+        self.BASE_ROLL_KP = float(cfg.base_roll_kp)
+        self.BASE_ROLL_KD = float(cfg.base_roll_kd)
+        self.BASE_AUTHORITY_RATE_PER_S = float(cfg.base_authority_rate_per_s)
+        self.BASE_COMMAND_LPF_HZ = float(cfg.base_command_lpf_hz)
+        self.UPRIGHT_BASE_DU_SCALE = float(cfg.upright_base_du_scale)
+        self.WHEEL_MOMENTUM_THRESH_FRAC = float(cfg.wheel_momentum_thresh_frac)
+        self.WHEEL_MOMENTUM_K = float(cfg.wheel_momentum_k)
+        self.WHEEL_MOMENTUM_UPRIGHT_K = float(cfg.wheel_momentum_upright_k)
+        self.HOLD_ENTER_ANGLE_RAD = float(cfg.hold_enter_angle_rad)
+        self.HOLD_EXIT_ANGLE_RAD = float(cfg.hold_exit_angle_rad)
+        self.HOLD_ENTER_RATE_RAD_S = float(cfg.hold_enter_rate_rad_s)
+        self.HOLD_EXIT_RATE_RAD_S = float(cfg.hold_exit_rate_rad_s)
+        self.WHEEL_SPIN_BUDGET_FRAC = float(cfg.wheel_spin_budget_frac)
+        self.WHEEL_SPIN_HARD_FRAC = float(cfg.wheel_spin_hard_frac)
+        self.WHEEL_SPIN_BUDGET_ABS_RAD_S = float(cfg.wheel_spin_budget_abs_rad_s)
+        self.WHEEL_SPIN_HARD_ABS_RAD_S = float(cfg.wheel_spin_hard_abs_rad_s)
+        self.HIGH_SPIN_EXIT_FRAC = float(cfg.high_spin_exit_frac)
+        self.HIGH_SPIN_COUNTER_MIN_FRAC = float(cfg.high_spin_counter_min_frac)
+        self.HIGH_SPIN_BASE_AUTHORITY_MIN = float(cfg.high_spin_base_authority_min)
+        self.WHEEL_TO_BASE_BIAS_GAIN = float(cfg.wheel_to_base_bias_gain)
+        self.RECOVERY_WHEEL_DESPIN_SCALE = float(cfg.recovery_wheel_despin_scale)
+        self.HOLD_WHEEL_DESPIN_SCALE = float(cfg.hold_wheel_despin_scale)
+        self.UPRIGHT_BLEND_RISE = float(cfg.upright_blend_rise)
+        self.UPRIGHT_BLEND_FALL = float(cfg.upright_blend_fall)
+        self.base_integrator_enabled = bool(cfg.base_integrator_enabled)
 
     def _resolve_ids(self):
         def jid(name: str) -> int:
@@ -276,19 +372,48 @@ class ControllerEvaluator:
         B = B_full[np.ix_(idx, [self.aid_rw, self.aid_base_x, self.aid_base_y])]
         return A, B
 
-    def _build_measurement_noise_cov(self, config: EpisodeConfig, wheel_lsb_rad_s: float) -> np.ndarray:
-        angle_var = float(config.imu_angle_noise_std_rad**2)
-        rate_var = float(config.imu_rate_noise_std_rad_s**2)
+    def _build_measurement_matrix(self, cfg: runtime_cfg.RuntimeConfig) -> np.ndarray:
+        rows = [
+            [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            [0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0],
+        ]
+        if cfg.base_state_from_sensors:
+            rows.extend(
+                [
+                    [0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0],
+                    [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+                    [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0],
+                    [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0],
+                ]
+            )
+        return np.asarray(rows, dtype=float)
+
+    def _build_measurement_noise_cov(self, cfg: runtime_cfg.RuntimeConfig, wheel_lsb_rad_s: float) -> np.ndarray:
+        angle_var = float(cfg.imu_angle_noise_std_rad**2)
+        rate_var = float(cfg.imu_rate_noise_std_rad_s**2)
         # Uniform quantization noise variance + additive rate-noise variance.
         wheel_quant_var = float((wheel_lsb_rad_s**2) / 12.0)
-        wheel_noise_var = float(config.wheel_encoder_rate_noise_std_rad_s**2)
-        return np.diag([angle_var, angle_var, rate_var, rate_var, wheel_quant_var + wheel_noise_var])
+        wheel_noise_var = float(cfg.wheel_encoder_rate_noise_std_rad_s**2)
+        variances = [angle_var, angle_var, rate_var, rate_var, wheel_quant_var + wheel_noise_var]
+        if cfg.base_state_from_sensors:
+            variances.extend(
+                [
+                    float(cfg.base_encoder_pos_noise_std_m**2),
+                    float(cfg.base_encoder_pos_noise_std_m**2),
+                    float(cfg.base_encoder_vel_noise_std_m_s**2),
+                    float(cfg.base_encoder_vel_noise_std_m_s**2),
+                ]
+            )
+        return np.diag(variances)
 
-    def _build_kalman_gain(self, config: EpisodeConfig, wheel_lsb_rad_s: float):
-        R_meas = self._build_measurement_noise_cov(config, wheel_lsb_rad_s)
-        Pk = self._solve_discrete_are_robust(self.A.T, self.C_MEAS.T, self.QN, R_meas, label="Kalman")
-        gram = self.C_MEAS @ Pk @ self.C_MEAS.T + R_meas
-        rhs = self.C_MEAS @ Pk.T
+    def _build_kalman_gain(self, cfg: runtime_cfg.RuntimeConfig, wheel_lsb_rad_s: float, C_meas: np.ndarray):
+        R_meas = self._build_measurement_noise_cov(cfg, wheel_lsb_rad_s)
+        Pk = self._solve_discrete_are_robust(self.A.T, C_meas.T, self.QN, R_meas, label="Kalman")
+        gram = C_meas @ Pk @ C_meas.T + R_meas
+        rhs = C_meas @ Pk.T
         return self._solve_linear_robust(gram, rhs, label="Kalman gain").T
 
     def _build_lqr_gain(self, params: CandidateParams):
@@ -340,31 +465,31 @@ class ControllerEvaluator:
 
         mujoco.mj_forward(self.model, self.data)
 
-    def _control_period_steps(self, config: EpisodeConfig) -> int:
-        if not config.hardware_realistic:
-            return 1
-        denom = max(config.control_hz, 1e-9)
-        return max(1, int(round(1.0 / (self.dt * denom))))
-
-    def _wheel_rate_lsb(self, config: EpisodeConfig, control_dt: float) -> float:
-        ticks = max(int(config.wheel_encoder_ticks_per_rev), 1)
-        return (2.0 * np.pi) / (ticks * control_dt)
-
     def _build_measurement(
         self,
         x_true: np.ndarray,
-        config: EpisodeConfig,
+        cfg: runtime_cfg.RuntimeConfig,
         wheel_lsb: float,
         rng: np.random.Generator,
         noise_scale: float = 1.0,
     ):
-        pitch = x_true[0] + rng.normal(0.0, noise_scale * config.imu_angle_noise_std_rad)
-        roll = x_true[1] + rng.normal(0.0, noise_scale * config.imu_angle_noise_std_rad)
-        pitch_rate = x_true[2] + rng.normal(0.0, noise_scale * config.imu_rate_noise_std_rad_s)
-        roll_rate = x_true[3] + rng.normal(0.0, noise_scale * config.imu_rate_noise_std_rad_s)
+        pitch = x_true[0] + rng.normal(0.0, noise_scale * cfg.imu_angle_noise_std_rad)
+        roll = x_true[1] + rng.normal(0.0, noise_scale * cfg.imu_angle_noise_std_rad)
+        pitch_rate = x_true[2] + rng.normal(0.0, noise_scale * cfg.imu_rate_noise_std_rad_s)
+        roll_rate = x_true[3] + rng.normal(0.0, noise_scale * cfg.imu_rate_noise_std_rad_s)
         wheel_quant = np.round(x_true[4] / wheel_lsb) * wheel_lsb
-        wheel_rate = wheel_quant + rng.normal(0.0, noise_scale * config.wheel_encoder_rate_noise_std_rad_s)
-        return np.array([pitch, roll, pitch_rate, roll_rate, wheel_rate], dtype=float)
+        wheel_rate = wheel_quant + rng.normal(0.0, noise_scale * cfg.wheel_encoder_rate_noise_std_rad_s)
+        y = [pitch, roll, pitch_rate, roll_rate, wheel_rate]
+        if cfg.base_state_from_sensors:
+            y.extend(
+                [
+                    x_true[5] + rng.normal(0.0, noise_scale * cfg.base_encoder_pos_noise_std_m),
+                    x_true[6] + rng.normal(0.0, noise_scale * cfg.base_encoder_pos_noise_std_m),
+                    x_true[7] + rng.normal(0.0, noise_scale * cfg.base_encoder_vel_noise_std_m_s),
+                    x_true[8] + rng.normal(0.0, noise_scale * cfg.base_encoder_vel_noise_std_m_s),
+                ]
+            )
+        return np.asarray(y, dtype=float)
 
     def simulate_episode(
         self,
@@ -378,17 +503,23 @@ class ControllerEvaluator:
         noise_scale, timing_jitter_frac = self._domain_noise_scales(config.domain_profile_id)
         A_run = self.A * a_scale
         B_run = self.B * b_scale
+        runtime_cfg_for_episode = self._resolve_runtime_cfg(config)
+        self._sync_runtime_tuning(runtime_cfg_for_episode)
 
-        control_steps = self._control_period_steps(config)
+        if not runtime_cfg_for_episode.hardware_realistic:
+            control_steps = 1
+        else:
+            denom_hz = max(float(runtime_cfg_for_episode.control_hz), 1e-9)
+            control_steps = max(1, int(round(1.0 / (self.dt * denom_hz))))
         control_dt = control_steps * self.dt
-        wheel_lsb = self._wheel_rate_lsb(config, control_dt)
-        cfg_meas = EpisodeConfig(**{**config.__dict__})
-        cfg_meas.imu_angle_noise_std_rad *= noise_scale
-        cfg_meas.imu_rate_noise_std_rad_s *= noise_scale
-        cfg_meas.wheel_encoder_rate_noise_std_rad_s *= noise_scale
-        L = self._build_kalman_gain(cfg_meas, wheel_lsb)
+        wheel_ticks = max(int(runtime_cfg_for_episode.wheel_encoder_ticks_per_rev), 1)
+        wheel_lsb = (2.0 * np.pi) / (wheel_ticks * control_dt)
+        C_meas = self._build_measurement_matrix(runtime_cfg_for_episode)
+        L = self._build_kalman_gain(runtime_cfg_for_episode, wheel_lsb, C_meas)
 
-        queue_len = 1 if not config.hardware_realistic else max(int(config.control_delay_steps), 0) + 1
+        queue_len = (
+            1 if not runtime_cfg_for_episode.hardware_realistic else max(int(runtime_cfg_for_episode.control_delay_steps), 0) + 1
+        )
         cmd_queue = deque([np.zeros(3, dtype=float) for _ in range(queue_len)], maxlen=queue_len)
 
         x_est = np.zeros(9, dtype=float)
@@ -479,20 +610,24 @@ class ControllerEvaluator:
 
             if step % effective_control_steps == 0:
                 control_updates += 1
-                y = self._build_measurement(x_true, config, wheel_lsb, rng, noise_scale=noise_scale)
-                x_est = x_pred + L @ (y - self.C_MEAS @ x_pred)
-                # Base states are unobserved by C_MEAS; anchor to avoid estimator drift.
-                x_est[5] = x_true[5]
-                x_est[6] = x_true[6]
-                x_est[7] = x_true[7]
-                x_est[8] = x_true[8]
+                y = self._build_measurement(x_true, runtime_cfg_for_episode, wheel_lsb, rng, noise_scale=noise_scale)
+                x_est = x_pred + L @ (y - C_meas @ x_pred)
+                if not runtime_cfg_for_episode.base_state_from_sensors:
+                    # Legacy observation model: anchor unmeasured base states.
+                    x_est[5] = x_true[5]
+                    x_est[6] = x_true[6]
+                    x_est[7] = x_true[7]
+                    x_est[8] = x_true[8]
 
                 x_ctrl = x_est.copy()
                 x_ctrl[5] -= self.X_REF
                 x_ctrl[6] -= self.Y_REF
 
-                base_int[0] = np.clip(base_int[0] + x_ctrl[5] * control_dt, -self.INT_CLAMP, self.INT_CLAMP)
-                base_int[1] = np.clip(base_int[1] + x_ctrl[6] * control_dt, -self.INT_CLAMP, self.INT_CLAMP)
+                if self.base_integrator_enabled:
+                    base_int[0] = np.clip(base_int[0] + x_ctrl[5] * control_dt, -self.INT_CLAMP, self.INT_CLAMP)
+                    base_int[1] = np.clip(base_int[1] + x_ctrl[6] * control_dt, -self.INT_CLAMP, self.INT_CLAMP)
+                else:
+                    base_int[:] = 0.0
 
                 if low_spin_robust:
                     angle_mag = max(abs(float(x_true[0])), abs(float(x_true[1])))
@@ -671,8 +806,9 @@ class ControllerEvaluator:
                     balance_y += float(-0.25 * kf * self.MAX_U[2] * np.tanh(s_roll / max(np.radians(0.5), 1e-3)))
                 base_target_x = (1.0 - base_authority) * hold_x + base_authority * balance_x
                 base_target_y = (1.0 - base_authority) * hold_y + base_authority * balance_y
-                base_target_x += -params.ki_base * base_int[0]
-                base_target_y += -params.ki_base * base_int[1]
+                if self.base_integrator_enabled:
+                    base_target_x += -params.ki_base * base_int[0]
+                    base_target_y += -params.ki_base * base_int[1]
                 if legacy_family:
                     base_target_x = 0.0
                     base_target_y = 0.0
@@ -926,6 +1062,7 @@ class ControllerEvaluator:
         episode_seeds: List[int],
         config: EpisodeConfig,
     ) -> Dict[str, float]:
+        runtime_cfg_for_episode = self._resolve_runtime_cfg(config)
         per_episode = [self.simulate_episode(params, s, config) for s in episode_seeds]
         episode_score_list = [self._episode_composite_score(m, config.steps) for m in per_episode]
 
@@ -1019,9 +1156,9 @@ class ControllerEvaluator:
             "crash_rate": crash_rate,
             "failure_reason": failure_reason,
             "confidence_tier": confidence_tier,
-            "hardware_realistic": bool(config.hardware_realistic),
-            "control_hz": float(config.control_hz),
-            "control_delay_steps": int(config.control_delay_steps),
+            "hardware_realistic": bool(runtime_cfg_for_episode.hardware_realistic),
+            "control_hz": float(runtime_cfg_for_episode.control_hz),
+            "control_delay_steps": int(runtime_cfg_for_episode.control_delay_steps),
             "preset": str(config.preset),
             "stability_profile": str(config.stability_profile),
             "controller_family": str(config.controller_family),
