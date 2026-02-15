@@ -216,7 +216,75 @@ Readiness outputs:
 - `final/results/readiness_<timestamp>.json`
 - `final/results/readiness_<timestamp>.md`
 
-## 11) Known Limits
+## 11) Historical Paper Comparison (Nuanced)
+
+### Intention of this comparison
+
+- The intent is to show **simulation-only advancement** through reproducibility, stress testing, and transparent benchmark artifacts.
+- The intent is **not** to dismiss physical robot work; fabrication tolerances, sensor drift, and integration constraints are real and matter.
+- Therefore, we compare with nuance: stronger simulation evaluation does not automatically mean universally better real-world control.
+
+### Reference paper (physical robot, about a decade earlier)
+
+- Source paper:
+  - J. Lee, S. Han, J. Lee, "Decoupled Dynamic Control for Pitch and Roll Axes of the Unicycle Robot," IEEE TIE, Vol. 60, No. 9, September 2013, DOI: `10.1109/TIE.2012.2208431`.
+- Local file used for review:
+  - `C:/Users/User/Downloads/onebot.pdf`
+- Extracted text artifact used in this repo:
+  - `final/results/onebot_extracted.txt`
+
+Paper-reported findings (hardware experiments):
+- Decoupled control architecture:
+  - roll: fuzzy-sliding mode
+  - pitch: LQR
+- Trajectory tests:
+  - ramp input over `3.3 m`
+  - ladder input over `1.1 m` forward/back
+  - parabolic input up to `2.8 m`
+- Reported angle error ranges:
+  - ramp: roll about `+/-1 deg`, pitch about `+/-2 deg`
+  - ladder: roll about `+/-2 deg`, pitch about `+/-4 deg`
+  - parabolic: mostly around `+/-1 deg` (roll), `+/-2 deg` (pitch), with temporary pitch increase above `4 deg` around `30 s`
+- Reported limitation: velocity remained below `0.1 m/s` due sensor speed limits.
+
+### This repo findings (simulation campaign)
+
+As of the benchmark run on `2026-02-16`:
+- Command:
+  - `python final/benchmark.py --benchmark-profile fast_pr --episodes 8 --steps 3000 --trials 0 --controller-families current,hybrid_modern,paper_split_baseline,baseline_mpc,baseline_robust_hinf_like --model-variants nominal --domain-rand-profile default --compare-modes default-vs-low-spin-robust --primary-objective balanced`
+- Artifacts:
+  - `final/results/benchmark_20260216_011044_summary.txt`
+  - `final/results/benchmark_20260216_011044.csv`
+  - `final/results/benchmark_20260216_011044_protocol.json`
+
+Key simulated baseline results (nominal/default):
+- `hybrid_modern`: survival `1.000`, crash rate `0.000`, composite score `74.460`
+- `current`: survival `1.000`, crash rate `0.000`, composite score `73.993`
+- `baseline_robust_hinf_like`: survival `1.000`, crash rate `0.000`, composite score `75.457`
+- `paper_split_baseline`: survival `1.000`, crash rate `0.000`, composite score `72.913`
+- `baseline_mpc`: survival `0.625`, crash rate `0.375`
+
+Simulation protocol highlights:
+- control timing and delay (`250 Hz`, `1` step delay)
+- injected sensor noise
+- periodic disturbances
+- multi-family comparator framework and reproducible artifacts
+
+### Nuanced claim boundary
+
+Reasonable claim:
+- This project advances **simulation evaluation rigor** (repeatability, explicit stress conditions, comparator breadth, and artifact traceability).
+- This project demonstrates stable balancing performance in simulation under configured noise, delay, and disturbance settings.
+
+Not yet a justified claim:
+- "Universally better control performance than the 2013 hardware robot" (not directly apples-to-apples without matched tasks/constraints).
+
+To make the comparison tighter in future work:
+- add a dedicated simulation benchmark that exactly matches the paper's trajectory tasks (`3.3 m` ramp, `1.1 m` ladder, `2.8 m` parabolic),
+- include matched speed limits and comparable sensor assumptions,
+- report the same tracking/error metrics side-by-side.
+
+## 12) Known Limits
 
 - This is still a simulation, not a certified hardware safety system.
 - Contact/friction/sensor models are approximations.
