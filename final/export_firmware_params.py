@@ -25,7 +25,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--easy-mode", action="store_true")
     parser.add_argument("--stop-on-crash", action="store_true")
     parser.add_argument("--wheel-only", action="store_true")
-    parser.add_argument("--allow-base-motion", action="store_true")
+    parser.add_argument(
+        "--allow-base-motion",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable base x/y actuation (enabled by default). Use --no-allow-base-motion to force wheel-only.",
+    )
+    parser.add_argument(
+        "--unlock-base",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Allow base x/y actuation in --real-hardware mode (enabled by default).",
+    )
     parser.add_argument("--enable-base-integrator", action="store_true")
     parser.add_argument("--seed", type=int, default=12345)
     parser.add_argument("--crash-angle-deg", type=float, default=25.0)

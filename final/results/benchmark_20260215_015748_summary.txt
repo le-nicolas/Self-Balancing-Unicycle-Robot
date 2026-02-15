@@ -1,6 +1,0 @@
-BASELINE
-hardware_realistic=True control_hz=250.0 delay_steps=1
-survival=1.000 worst_tilt=19.739deg worst_base=1.234m sat_du=0.4818 sat_abs=0.0010 osc2_8Hz=3.1506 flip_rate=0.7743 activity=0.3584 jerk=15.5919 energy=300.8691
-
-TOP-5 SURVIVAL=1.0 (objective: worst_base + jerk)
-baseline: survival=1.000, worst_tilt=19.739deg, worst_base=1.234m, sat_du=0.4818, sat_abs=0.0010, osc2_8Hz=3.1506, flip_rate=0.7743, activity=0.3584, jerk=15.5919, energy=300.8691, d_survival=0.000, d_base=0.000, d_tilt=0.000, d_osc=0.0000, d_flip=0.0000, d_activity=0.0000, d_jerk=0.0000, d_energy=0.0000

@@ -1,5 +1,0 @@
-BASELINE
-survival=1.000 worst_tilt=6.002deg worst_base=2.155m energy=20360.2877
-
-NO ACCEPTED CANDIDATES
-best_fallback=baseline: survival=1.000, worst_base=2.155m

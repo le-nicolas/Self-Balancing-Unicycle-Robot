@@ -1,9 +1,0 @@
-BASELINE
-survival=1.000 worst_tilt=5.478deg worst_base=1.444m osc2_8Hz=1537.4094 flip_rate=0.0117 activity=1.3720 jerk=1.6937 energy=16944.1470
-
-TOP-5 ACCEPTED
-trial_003: survival=1.000, worst_tilt=4.980deg, worst_base=0.375m, osc2_8Hz=992.3410, flip_rate=0.0113, activity=0.9730, jerk=1.0770, energy=12142.1659, d_survival=0.000, d_base=-1.069, d_tilt=-0.498, d_osc=-545.0684, d_flip=-0.0003, d_activity=-0.3990, d_jerk=-0.6167, d_energy=-4801.9811
-trial_000: survival=1.000, worst_tilt=6.136deg, worst_base=0.922m, osc2_8Hz=5478.4876, flip_rate=0.0240, activity=2.2624, jerk=3.5550, energy=11709.0875, d_survival=0.000, d_base=-0.522, d_tilt=0.658, d_osc=3941.0783, d_flip=0.0123, d_activity=0.8905, d_jerk=1.8613, d_energy=-5235.0595
-trial_002: survival=1.000, worst_tilt=6.058deg, worst_base=0.942m, osc2_8Hz=3899.6581, flip_rate=0.0223, activity=2.0139, jerk=2.9889, energy=11929.5565, d_survival=0.000, d_base=-0.502, d_tilt=0.580, d_osc=2362.2487, d_flip=0.0107, d_activity=0.6420, d_jerk=1.2952, d_energy=-5014.5905
-trial_004: survival=1.000, worst_tilt=5.649deg, worst_base=1.307m, osc2_8Hz=2743.4493, flip_rate=0.0137, activity=1.5122, jerk=1.9347, energy=15903.5834, d_survival=0.000, d_base=-0.137, d_tilt=0.171, d_osc=1206.0399, d_flip=0.0020, d_activity=0.1402, d_jerk=0.2410, d_energy=-1040.5635
-trial_001: survival=1.000, worst_tilt=5.647deg, worst_base=1.332m, osc2_8Hz=2756.5246, flip_rate=0.0140, activity=1.4994, jerk=1.9183, energy=15178.7694, d_survival=0.000, d_base=-0.112, d_tilt=0.169, d_osc=1219.1152, d_flip=0.0023, d_activity=0.1274, d_jerk=0.2245, d_energy=-1765.3775

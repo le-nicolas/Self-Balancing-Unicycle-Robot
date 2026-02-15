@@ -1,6 +1,0 @@
-BASELINE
-hardware_realistic=True control_hz=250.0 delay_steps=1
-survival=0.750 worst_tilt=20.000deg worst_base=0.784m sat_du=0.4511 sat_abs=0.0000 osc2_8Hz=2.9431 flip_rate=0.7448 activity=0.3547 jerk=14.6420 energy=294.8094
-
-NO ACCEPTED CANDIDATES
-best_fallback=baseline: survival=0.750, worst_base=0.784m, failure_reason=gate_survival+gate_tilt

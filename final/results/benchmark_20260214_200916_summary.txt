@@ -1,7 +1,0 @@
-BASELINE
-survival=1.000 worst_tilt=5.315deg worst_base=2.155m energy=17838.5130
-
-TOP-5 ACCEPTED
-trial_001: survival=1.000, worst_tilt=6.136deg, worst_base=0.922m, energy=11709.0875, d_survival=0.000, d_base=-1.233, d_tilt=0.821, d_energy=-6129.4255
-trial_002: survival=1.000, worst_tilt=6.227deg, worst_base=1.136m, energy=11259.8054, d_survival=0.000, d_base=-1.019, d_tilt=0.912, d_energy=-6578.7076
-trial_000: survival=1.000, worst_tilt=5.993deg, worst_base=1.158m, energy=11197.0890, d_survival=0.000, d_base=-0.996, d_tilt=0.678, d_energy=-6641.4240

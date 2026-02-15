@@ -1,5 +1,0 @@
-BASELINE
-survival=0.000 worst_tilt=90.501deg worst_base=0.704m osc2_8Hz=1445.5368 flip_rate=0.0073 activity=6.8714 jerk=2.8426 energy=100399.0194
-
-NO ACCEPTED CANDIDATES
-best_fallback=baseline: survival=0.000, worst_base=0.704m

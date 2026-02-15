@@ -1,5 +1,0 @@
-BASELINE
-survival=0.000 worst_tilt=90.000deg worst_base=0.585m sat_du=1.0000 sat_abs=0.5167 osc2_8Hz=718.4755 flip_rate=0.0212 activity=7.1686 jerk=4.3456 energy=115822.8397
-
-NO ACCEPTED CANDIDATES
-best_fallback=baseline: survival=0.000, worst_base=0.585m, failure_reason=gate_survival+gate_tilt+gate_sat_du

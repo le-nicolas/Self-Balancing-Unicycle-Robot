@@ -1,6 +1,0 @@
-BASELINE
-survival=1.000 worst_tilt=5.478deg worst_base=1.444m osc2_8Hz=1537.4094 flip_rate=0.0117 activity=1.3720 jerk=1.6937 energy=16944.1470
-
-TOP-5 ACCEPTED
-trial_001: survival=1.000, worst_tilt=6.136deg, worst_base=0.922m, osc2_8Hz=5478.4876, flip_rate=0.0240, activity=2.2624, jerk=3.5550, energy=11709.0875, d_survival=0.000, d_base=-0.522, d_tilt=0.658, d_osc=3941.0783, d_flip=0.0123, d_activity=0.8905, d_jerk=1.8613, d_energy=-5235.0595
-trial_000: survival=1.000, worst_tilt=5.993deg, worst_base=1.158m, osc2_8Hz=4716.4722, flip_rate=0.0223, activity=2.2423, jerk=3.0537, energy=11197.0890, d_survival=0.000, d_base=-0.286, d_tilt=0.515, d_osc=3179.0628, d_flip=0.0107, d_activity=0.8703, d_jerk=1.3600, d_energy=-5747.0580
