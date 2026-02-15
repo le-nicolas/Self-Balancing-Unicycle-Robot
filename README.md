@@ -1,5 +1,13 @@
 # Reaction Wheel Balancer (Non-Technical Guide)
 
+
+
+https://github.com/user-attachments/assets/586ee1d3-beb5-460e-8ca5-f6c0afe3e5ce
+
+<img width="836" height="696" alt="Screenshot 2026-02-15 134403" src="https://github.com/user-attachments/assets/bfab47e0-a868-42be-bca1-90a2e9d7474f" />
+
+
+
 This project simulates a self-balancing robot in MuJoCo.
 
 In simple terms:
