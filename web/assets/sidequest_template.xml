@@ -1,0 +1,47 @@
+<mujoco model="payload_sidequest">
+  <compiler angle="radian"/>
+  <option timestep="0.002" gravity="0 0 -9.81" integrator="RK4"/>
+
+  <worldbody>
+    <light pos="1.5 -2.0 3.0" dir="-0.2 0.3 -1.0" directional="true"/>
+    <geom name="ground" type="plane" size="4 4 0.1" rgba="0.20 0.26 0.31 1.0" friction="1.8 0.05 0.001"/>
+
+    <body name="base_x" pos="0 0 0.08">
+      <inertial pos="0 0 0" mass="0.01" diaginertia="1e-6 1e-6 1e-6"/>
+      <joint name="base_x_slide" type="slide" axis="1 0 0" limited="true" range="-2 2" damping="1.2" armature="0.02"/>
+
+      <body name="base_y" pos="0 0 0">
+        <joint name="base_y_slide" type="slide" axis="0 1 0" limited="true" range="-2 2" damping="1.2" armature="0.02"/>
+
+        <geom name="base_geom" type="cylinder" size="0.15 0.05" mass="0.8" quat="0.7071 0 0.7071 0" rgba="0.16 0.56 0.94 1.0"/>
+
+        <body name="stick_pitch_frame" pos="0 0 0.1">
+          <inertial pos="0 0 0" mass="0.01" diaginertia="1e-5 1e-5 1e-5"/>
+          <joint name="stick_pitch" type="hinge" axis="0 1 0" damping="9.0" armature="0.04" range="-3.14 3.14"/>
+
+          <body name="stick" pos="0 0 0">
+            <joint name="stick_roll" type="hinge" axis="1 0 0" damping="11.0" armature="0.04" range="-3.14 3.14"/>
+            <geom name="stick_geom" type="capsule" fromto="0 0 0 0 0 0.5" size="0.04" mass="1.0" rgba="0.94 0.35 0.31 1.0"/>
+
+            <body name="wheel" pos="0 0 0.34">
+              <joint name="wheel_spin" type="hinge" axis="0 1 0" damping="0.4"/>
+              <geom name="wheel_geom" type="cylinder" size="0.18 0.03" mass="0.7" quat="0.7071 0.7071 0 0" rgba="0.80 0.63 0.40 1.0"/>
+              <geom name="wheel_hub" type="sphere" size="0.045" mass="0.08" rgba="0.95 0.92 0.25 1.0"/>
+            </body>
+
+            <body name="payload" pos="0 0 0.57">
+              <inertial pos="0 0 0" mass="__PAYLOAD_MASS__" diaginertia="0.00012 0.00012 0.00012"/>
+              <geom name="payload_geom" type="box" size="0.055 0.055 0.03" mass="0" rgba="0.98 0.76 0.30 1.0" friction="1.2 0.02 0.001"/>
+            </body>
+          </body>
+        </body>
+      </body>
+    </body>
+  </worldbody>
+
+  <actuator>
+    <motor name="wheel_spin" joint="wheel_spin" ctrlrange="-220 220"/>
+    <motor name="base_x_force" joint="base_x_slide" ctrlrange="-160 160"/>
+    <motor name="base_y_force" joint="base_y_slide" ctrlrange="-160 160"/>
+  </actuator>
+</mujoco>

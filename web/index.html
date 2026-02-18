@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Payload Overload Side Quest</title>
+  <link rel="stylesheet" href="./styles.css" />
+</head>
+<body>
+  <main class="app-shell">
+    <section class="panel">
+      <h1>Payload Overload</h1>
+      <p class="subtitle">MuJoCo WebAssembly + Three.js</p>
+
+      <label for="massRange">Payload Mass (kg)</label>
+      <input id="massRange" type="range" min="0" max="3" step="0.05" value="0.4" />
+      <input id="massNumber" type="number" min="0" max="3" step="0.05" value="0.4" />
+
+      <div class="button-row">
+        <button id="applyBtn" type="button">Apply &amp; Reset</button>
+        <button id="pauseBtn" type="button">Pause</button>
+      </div>
+
+      <dl class="hud">
+        <div>
+          <dt>Status</dt>
+          <dd id="statusValue">Loading...</dd>
+        </div>
+        <div>
+          <dt>Elapsed</dt>
+          <dd id="elapsedValue">0.00 s</dd>
+        </div>
+        <div>
+          <dt>COM Dist</dt>
+          <dd id="comValue">0.000 m</dd>
+        </div>
+        <div>
+          <dt>Max Stable Mass</dt>
+          <dd id="maxStableValue">0.00 kg</dd>
+        </div>
+      </dl>
+    </section>
+
+    <section class="viewer-wrap">
+      <canvas id="simCanvas"></canvas>
+    </section>
+  </main>
+
+  <script type="module" src="./app.js"></script>
+</body>
+</html>

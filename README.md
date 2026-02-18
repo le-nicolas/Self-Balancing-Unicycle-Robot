@@ -143,6 +143,11 @@ Viewer run:
 python final/final.py --mode smooth
 ```
 
+Payload overload run (physical payload attached on top of the stick):
+```bash
+python final/final.py --mode smooth --payload-mass 0.8
+```
+
 Robust profile:
 ```bash
 python final/final.py --mode robust --stability-profile low-spin-robust
@@ -159,6 +164,12 @@ Optional residual correction run:
 ```bash
 python final/final.py --mode smooth --residual-model path/to/residual.pt --residual-scale 0.20
 ```
+
+Web side quest (Brave):
+```bash
+python -m http.server 8080
+```
+Open `http://localhost:8080/web/` and use the payload mass controls.
 
 Wheel-spin diagnostics:
 - runtime summary now reports signed wheel speed peaks, mean absolute wheel speed, over-budget/over-hard ratios (total and sign-split), and hard-zone suppression counters for tuning.

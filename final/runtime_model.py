@@ -24,6 +24,8 @@ class ModelIds:
     base_x_body_id: int
     base_y_body_id: int
     stick_body_id: int
+    payload_body_id: int
+    payload_geom_id: int
 
 
 def lookup_model_ids(model: mujoco.MjModel) -> ModelIds:
@@ -55,6 +57,8 @@ def lookup_model_ids(model: mujoco.MjModel) -> ModelIds:
         base_x_body_id=mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "base_x"),
         base_y_body_id=mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "base_y"),
         stick_body_id=mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "stick"),
+        payload_body_id=mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "payload"),
+        payload_geom_id=mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, "payload_geom"),
     )
 
 
@@ -96,6 +100,34 @@ def reset_state(model, data, q_pitch, q_roll, pitch_eq=0.0, roll_eq=0.0):
     data.qpos[q_pitch] = pitch_eq
     data.qpos[q_roll] = roll_eq
     mujoco.mj_forward(model, data)
+
+
+def set_payload_mass(model: mujoco.MjModel, data: mujoco.MjData, ids: ModelIds, payload_mass_kg: float) -> float:
+    """Set runtime payload mass while keeping a valid positive-definite inertia tensor."""
+    if ids.payload_body_id < 0 or ids.payload_geom_id < 0:
+        return 0.0
+    mass_target = float(max(payload_mass_kg, 0.0))
+    mass_runtime = max(mass_target, 1e-6)
+    sx, sy, sz = model.geom_size[ids.payload_geom_id, :3]
+    ixx = (mass_runtime / 3.0) * (sy * sy + sz * sz)
+    iyy = (mass_runtime / 3.0) * (sx * sx + sz * sz)
+    izz = (mass_runtime / 3.0) * (sx * sx + sy * sy)
+    model.body_mass[ids.payload_body_id] = mass_runtime
+    model.body_inertia[ids.payload_body_id, :] = np.array([ixx, iyy, izz], dtype=float)
+    mujoco.mj_setConst(model, data)
+    mujoco.mj_forward(model, data)
+    return mass_target
+
+
+def compute_robot_com_distance_xy(model: mujoco.MjModel, data: mujoco.MjData, support_body_id: int) -> float:
+    """Planar COM distance from support-body origin."""
+    masses = model.body_mass[1:]
+    total_mass = float(np.sum(masses))
+    if total_mass <= 1e-12:
+        return 0.0
+    com_xy = (masses[:, None] * data.xipos[1:, :2]).sum(axis=0) / total_mass
+    support_xy = data.xpos[support_body_id, :2]
+    return float(np.linalg.norm(com_xy - support_xy))
 
 
 def build_partial_measurement_matrix(cfg: RuntimeConfig):

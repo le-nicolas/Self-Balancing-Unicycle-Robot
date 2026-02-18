@@ -11,11 +11,13 @@ from runtime_model import (
     build_kalman_gain,
     build_measurement_noise_cov,
     build_partial_measurement_matrix,
+    compute_robot_com_distance_xy,
     enforce_wheel_only_constraints,
     estimator_measurement_update,
     get_true_state,
     lookup_model_ids,
     reset_state,
+    set_payload_mass,
 )
 from control_core import (
     apply_control_delay,
@@ -75,10 +77,12 @@ def main():
         model.opt.gravity[2] = -6.5
 
     ids = lookup_model_ids(model)
+    payload_mass_kg = set_payload_mass(model, data, ids, cfg.payload_mass_kg)
     push_body_id = {
         "stick": ids.stick_body_id,
         "base_y": ids.base_y_body_id,
         "base_x": ids.base_x_body_id,
+        "payload": ids.payload_body_id,
     }[args.push_body]
     reset_state(model, data, ids.q_pitch, ids.q_roll, pitch_eq=0.0, roll_eq=initial_roll_rad)
 
@@ -264,6 +268,11 @@ def main():
     print(f"residual_status={residual_policy.status}")
     print(f"Initial Y-direction tilt (roll): {args.initial_y_tilt_deg:.2f} deg")
     print(
+        "Payload: "
+        f"mass={payload_mass_kg:.3f}kg support_radius={cfg.payload_support_radius_m:.3f}m "
+        f"com_fail_steps={cfg.payload_com_fail_steps}"
+    )
+    print(
         "Scripted push: "
         f"body={args.push_body} F=({args.push_x:.2f}, {args.push_y:.2f})N "
         f"start={args.push_start_s:.2f}s duration={args.push_duration_s:.2f}s"
@@ -325,6 +334,11 @@ def main():
     residual_clipped_count = 0
     residual_gate_blocked_count = 0
     residual_max_abs = np.zeros(NU, dtype=float)
+    com_planar_dist = compute_robot_com_distance_xy(model, data, ids.base_y_body_id)
+    max_com_planar_dist = com_planar_dist
+    com_over_support_steps = 0
+    com_fail_streak = 0
+    com_overload_failures = 0
     prev_script_force = np.zeros(3, dtype=float)
     control_terms_writer = None
     control_terms_file = None
@@ -407,6 +421,9 @@ def main():
                 "u_rw",
                 "u_bx",
                 "u_by",
+                "payload_mass_kg",
+                "com_planar_dist_m",
+                "com_over_support",
             ],
         )
         trace_events_writer.writeheader()
@@ -424,10 +441,13 @@ def main():
                 enforce_wheel_only_constraints(model, data, ids)
 
             x_true = get_true_state(data, ids)
+            com_planar_dist = compute_robot_com_distance_xy(model, data, ids.base_y_body_id)
+            max_com_planar_dist = max(max_com_planar_dist, com_planar_dist)
 
             if not np.all(np.isfinite(x_true)):
                 print(f"\nNumerical instability at step {step_count}; resetting state.")
                 reset_state(model, data, ids.q_pitch, ids.q_roll, pitch_eq=0.0, roll_eq=initial_roll_rad)
+                com_fail_streak = 0
                 (
                     x_est,
                     u_applied,
@@ -588,6 +608,9 @@ def main():
                             "u_rw": float(u_cmd[0]),
                             "u_bx": float(u_cmd[1]),
                             "u_by": float(u_cmd[2]),
+                            "payload_mass_kg": float(payload_mass_kg),
+                            "com_planar_dist_m": float(com_planar_dist),
+                            "com_over_support": int(com_planar_dist > cfg.payload_support_radius_m),
                         }
                     )
                 u_applied = apply_control_delay(cfg, cmd_queue, u_cmd)
@@ -664,6 +687,13 @@ def main():
             speed_limit_hits[2] += int(abs(data.qvel[ids.v_roll]) > cfg.max_pitch_roll_rate_rad_s)
             speed_limit_hits[3] += int(abs(data.qvel[ids.v_base_x]) > cfg.max_base_speed_m_s)
             speed_limit_hits[4] += int(abs(data.qvel[ids.v_base_y]) > cfg.max_base_speed_m_s)
+            com_planar_dist = compute_robot_com_distance_xy(model, data, ids.base_y_body_id)
+            max_com_planar_dist = max(max_com_planar_dist, com_planar_dist)
+            if com_planar_dist > cfg.payload_support_radius_m:
+                com_over_support_steps += 1
+                com_fail_streak += 1
+            else:
+                com_fail_streak = 0
             # Push latest state to viewer.
             viewer.sync()
 
@@ -678,11 +708,15 @@ def main():
                 print(
                     f"Step {step_count}: pitch={np.degrees(pitch):6.2f}deg roll={np.degrees(roll):6.2f}deg "
                     f"x={base_x:7.3f} y={base_y:7.3f} u_rw={u_eff_applied[0]:8.1f} "
-                    f"u_bx={u_eff_applied[1]:7.2f} u_by={u_eff_applied[2]:7.2f}"
+                    f"u_bx={u_eff_applied[1]:7.2f} u_by={u_eff_applied[2]:7.2f} "
+                    f"com_xy={com_planar_dist:6.3f}m"
                 )
 
-            if abs(pitch) >= cfg.crash_angle_rad or abs(roll) >= cfg.crash_angle_rad:
+            tilt_failed = abs(pitch) >= cfg.crash_angle_rad or abs(roll) >= cfg.crash_angle_rad
+            com_failed = com_fail_streak >= cfg.payload_com_fail_steps
+            if tilt_failed or com_failed:
                 crash_count += 1
+                com_overload_failures += int(com_failed)
                 if trace_events_writer is not None:
                     trace_events_writer.writerow(
                         {
@@ -707,15 +741,20 @@ def main():
                             "u_rw": float(u_eff_applied[0]),
                             "u_bx": float(u_eff_applied[1]),
                             "u_by": float(u_eff_applied[2]),
+                            "payload_mass_kg": float(payload_mass_kg),
+                            "com_planar_dist_m": float(com_planar_dist),
+                            "com_over_support": int(com_planar_dist > cfg.payload_support_radius_m),
                         }
                     )
                 print(
                     f"\nCRASH #{crash_count} at step {step_count}: "
-                    f"pitch={np.degrees(pitch):.2f}deg roll={np.degrees(roll):.2f}deg"
+                    f"pitch={np.degrees(pitch):.2f}deg roll={np.degrees(roll):.2f}deg "
+                    f"com_xy={com_planar_dist:.3f}m reason={'com_overload' if com_failed else 'tilt'}"
                 )
                 if cfg.stop_on_crash:
                     break
                 reset_state(model, data, ids.q_pitch, ids.q_roll, pitch_eq=0.0, roll_eq=initial_roll_rad)
+                com_fail_streak = 0
                 (
                     x_est,
                     u_applied,
@@ -743,6 +782,10 @@ def main():
     print(f"Crash count: {crash_count}")
     print(f"Max |pitch|: {np.degrees(max_pitch):.2f}deg")
     print(f"Max |roll|: {np.degrees(max_roll):.2f}deg")
+    print(f"Payload mass: {payload_mass_kg:.3f}kg")
+    print(f"Max COM planar distance: {max_com_planar_dist:.3f}m")
+    print(f"COM over-support ratio: {com_over_support_steps / max(step_count, 1):.3f}")
+    print(f"COM overload crash count: {com_overload_failures}")
     denom = max(control_updates, 1)
     print(f"Abs-limit hit rate [rw,bx,by]: {(sat_hits / denom)}")
     print(f"Delta-u clip rate [rw,bx,by]: {(du_hits / denom)}")

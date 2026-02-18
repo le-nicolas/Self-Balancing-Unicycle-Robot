@@ -51,6 +51,9 @@ class RuntimeConfig:
     base_integrator_enabled: bool
     u_bleed: float
     crash_angle_rad: float
+    payload_mass_kg: float
+    payload_support_radius_m: float
+    payload_com_fail_steps: int
     x_ref: float
     y_ref: float
     int_clamp: float
@@ -240,6 +243,24 @@ def parse_args(argv=None):
         help="Initial stick tilt in degrees in Y direction (implemented as roll for base_y response).",
     )
     parser.add_argument("--crash-angle-deg", type=float, default=25.0)
+    parser.add_argument(
+        "--payload-mass",
+        type=float,
+        default=0.0,
+        help="Physical payload mass attached on top of the stick (kg).",
+    )
+    parser.add_argument(
+        "--payload-support-radius-m",
+        type=float,
+        default=0.145,
+        help="Support radius for COM-over-support failure check (m).",
+    )
+    parser.add_argument(
+        "--payload-com-fail-steps",
+        type=int,
+        default=15,
+        help="Consecutive steps beyond support radius required to trigger overload failure.",
+    )
     parser.add_argument("--disturbance-mag", type=float, default=None)
     parser.add_argument("--disturbance-interval", type=int, default=None)
     parser.add_argument("--control-hz", type=float, default=250.0)
@@ -274,7 +295,7 @@ def parse_args(argv=None):
     )
     parser.add_argument(
         "--push-body",
-        choices=["stick", "base_y", "base_x"],
+        choices=["stick", "base_y", "base_x", "payload"],
         default="stick",
         help="Body used for scripted push force.",
     )
@@ -615,6 +636,9 @@ def build_config(args) -> RuntimeConfig:
     residual_max_abs_u = np.minimum(residual_max_abs_u, max_u)
     residual_gate_tilt_rad = float(np.radians(max(float(getattr(args, "residual_gate_tilt_deg", 0.0)), 0.0)))
     residual_gate_rate_rad_s = float(max(float(getattr(args, "residual_gate_rate", 0.0)), 0.0))
+    payload_mass_kg = float(max(getattr(args, "payload_mass", 0.0), 0.0))
+    payload_support_radius_m = float(max(getattr(args, "payload_support_radius_m", 0.145), 0.01))
+    payload_com_fail_steps = int(max(getattr(args, "payload_com_fail_steps", 15), 1))
 
     return RuntimeConfig(
         controller_family=str(getattr(args, "controller_family", "current")),
@@ -662,6 +686,9 @@ def build_config(args) -> RuntimeConfig:
         base_integrator_enabled=bool(args.enable_base_integrator),
         u_bleed=u_bleed,
         crash_angle_rad=np.radians(crash_angle_deg),
+        payload_mass_kg=payload_mass_kg,
+        payload_support_radius_m=payload_support_radius_m,
+        payload_com_fail_steps=payload_com_fail_steps,
         x_ref=0.0,
         y_ref=0.0,
         int_clamp=2.0,

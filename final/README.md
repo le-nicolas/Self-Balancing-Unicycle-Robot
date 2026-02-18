@@ -188,6 +188,12 @@ Run default smooth mode:
 python final/final.py --mode smooth
 ```
 
+Run with top payload mass:
+
+```bash
+python final/final.py --mode smooth --payload-mass 0.8
+```
+
 Run robust profile:
 
 ```bash
