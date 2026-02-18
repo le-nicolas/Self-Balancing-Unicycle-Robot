@@ -604,7 +604,7 @@ def main():
     parser = argparse.ArgumentParser(description="Full final.py runtime web server")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8090)
-    parser.add_argument("--mode", choices=["smooth", "robust"], default="smooth")
+    parser.add_argument("--mode", choices=["smooth", "robust"], default="robust")
     parser.add_argument("--payload-mass", type=float, default=0.4)
     args = parser.parse_args()
 

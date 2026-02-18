@@ -16,6 +16,13 @@ From repo root:
 python web/server.py --port 8090
 ```
 
+Default backend mode is `robust` for stronger payload tolerance.
+If you want the original smoother profile, run:
+
+```bash
+python web/server.py --port 8090 --mode smooth
+```
+
 Then open:
 
 `http://localhost:8090/web/`
