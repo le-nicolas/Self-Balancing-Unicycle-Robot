@@ -1,4 +1,4 @@
-# Web Side Quest: Payload Overload
+# Web Side Quest: Self Balancing Bot
 
 This side quest runs a balancing bot in **MuJoCo WebAssembly** with **Three.js** rendering.
 You change payload mass, reset, and observe whether it stabilizes or fails from overload.

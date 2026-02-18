@@ -1,11 +1,11 @@
-import * as THREE from "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js";
-import { OrbitControls } from "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/controls/OrbitControls.js";
-import loadMujoco from "https://cdn.jsdelivr.net/npm/mujoco-js@0.0.7/dist/mujoco_wasm.js";
+import * as THREE from "./vendor/three.module.js";
+import loadMujoco from "./vendor/mujoco_wasm.js";
 
 const SUPPORT_RADIUS_M = 0.145;
 const COM_FAIL_STEPS = 15;
 const CRASH_ANGLE_RAD = 0.43;
 const STABLE_CONFIRM_S = 4.0;
+const MUJOCO_LOAD_TIMEOUT_MS = 45000;
 
 const CTRL = {
   rwKp: 210.0,
@@ -53,7 +53,6 @@ const sim = {
   scene: null,
   camera: null,
   renderer: null,
-  controls: null,
   visuals: {},
 };
 
@@ -95,13 +94,15 @@ function initUiBindings() {
 }
 
 async function boot() {
-  setStatus("Loading MuJoCo WebAssembly...", false);
-  sim.mujoco = await loadMujoco();
+  setStatus("Loading model template...", false);
   const templateResp = await fetch("./assets/sidequest_template.xml");
   if (!templateResp.ok) {
     throw new Error(`Cannot load XML template (${templateResp.status})`);
   }
   sim.xmlTemplate = await templateResp.text();
+  setStatus("Loading MuJoCo WebAssembly...", false);
+  sim.mujoco = await withTimeout(loadMujoco(), MUJOCO_LOAD_TIMEOUT_MS, "MuJoCo load timed out");
+  configureVirtualFs();
 
   initThreeScene();
   await rebuildSimulation(Number(ui.massRange.value));
@@ -115,14 +116,11 @@ function initThreeScene() {
 
   sim.camera = new THREE.PerspectiveCamera(48, 1, 0.01, 80);
   sim.camera.position.set(2.5, -3.3, 1.6);
+  sim.camera.lookAt(0.0, 0.0, 0.45);
 
   sim.renderer = new THREE.WebGLRenderer({ canvas: ui.canvas, antialias: true });
   sim.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2.0));
   sim.renderer.shadowMap.enabled = true;
-
-  sim.controls = new OrbitControls(sim.camera, ui.canvas);
-  sim.controls.target.set(0.0, 0.0, 0.45);
-  sim.controls.enableDamping = true;
 
   const keyLight = new THREE.DirectionalLight(0xffffff, 1.1);
   keyLight.position.set(2.2, -2.2, 4.0);
@@ -248,6 +246,18 @@ function ensureFsDir(path) {
     sim.mujoco.FS.stat(path);
   } catch {
     sim.mujoco.FS.mkdir(path);
+  }
+}
+
+function configureVirtualFs() {
+  ensureFsDir("/working");
+  try {
+    sim.mujoco.FS.mount(sim.mujoco.MEMFS, { root: "." }, "/working");
+  } catch (err) {
+    const msg = String(err && err.message ? err.message : err).toLowerCase();
+    if (!msg.includes("already mounted") && !msg.includes("busy")) {
+      throw err;
+    }
   }
 }
 
@@ -389,9 +399,6 @@ function animate() {
     syncVisuals();
     updateHud();
   }
-  if (sim.controls) {
-    sim.controls.update();
-  }
   if (sim.renderer && sim.scene && sim.camera) {
     sim.renderer.render(sim.scene, sim.camera);
   }
@@ -433,4 +440,20 @@ function setStatus(text, danger) {
 
 function clamp(value, min, max) {
   return Math.min(Math.max(value, min), max);
+}
+
+async function withTimeout(promise, timeoutMs, timeoutMessage) {
+  let timer = null;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error(timeoutMessage)), timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timer !== null) {
+      clearTimeout(timer);
+    }
+  }
 }
