@@ -263,11 +263,14 @@ function configureVirtualFs() {
 
 function resolveIds(model) {
   const mjtObj = sim.mujoco.mjtObj;
-  const jidPitch = sim.mujoco.mj_name2id(model, mjtObj.mjOBJ_JOINT, "stick_pitch");
-  const jidRoll = sim.mujoco.mj_name2id(model, mjtObj.mjOBJ_JOINT, "stick_roll");
-  const jidRw = sim.mujoco.mj_name2id(model, mjtObj.mjOBJ_JOINT, "wheel_spin");
-  const jidBaseX = sim.mujoco.mj_name2id(model, mjtObj.mjOBJ_JOINT, "base_x_slide");
-  const jidBaseY = sim.mujoco.mj_name2id(model, mjtObj.mjOBJ_JOINT, "base_y_slide");
+  const OBJ_JOINT = mjtObj.mjOBJ_JOINT.value;
+  const OBJ_ACTUATOR = mjtObj.mjOBJ_ACTUATOR.value;
+  const OBJ_BODY = mjtObj.mjOBJ_BODY.value;
+  const jidPitch = sim.mujoco.mj_name2id(model, OBJ_JOINT, "stick_pitch");
+  const jidRoll = sim.mujoco.mj_name2id(model, OBJ_JOINT, "stick_roll");
+  const jidRw = sim.mujoco.mj_name2id(model, OBJ_JOINT, "wheel_spin");
+  const jidBaseX = sim.mujoco.mj_name2id(model, OBJ_JOINT, "base_x_slide");
+  const jidBaseY = sim.mujoco.mj_name2id(model, OBJ_JOINT, "base_y_slide");
 
   return {
     qPitch: model.jnt_qposadr[jidPitch],
@@ -279,13 +282,13 @@ function resolveIds(model) {
     vRw: model.jnt_dofadr[jidRw],
     vBaseX: model.jnt_dofadr[jidBaseX],
     vBaseY: model.jnt_dofadr[jidBaseY],
-    aidRw: sim.mujoco.mj_name2id(model, mjtObj.mjOBJ_ACTUATOR, "wheel_spin"),
-    aidBaseX: sim.mujoco.mj_name2id(model, mjtObj.mjOBJ_ACTUATOR, "base_x_force"),
-    aidBaseY: sim.mujoco.mj_name2id(model, mjtObj.mjOBJ_ACTUATOR, "base_y_force"),
-    bidBaseY: sim.mujoco.mj_name2id(model, mjtObj.mjOBJ_BODY, "base_y"),
-    bidStick: sim.mujoco.mj_name2id(model, mjtObj.mjOBJ_BODY, "stick"),
-    bidWheel: sim.mujoco.mj_name2id(model, mjtObj.mjOBJ_BODY, "wheel"),
-    bidPayload: sim.mujoco.mj_name2id(model, mjtObj.mjOBJ_BODY, "payload"),
+    aidRw: sim.mujoco.mj_name2id(model, OBJ_ACTUATOR, "wheel_spin"),
+    aidBaseX: sim.mujoco.mj_name2id(model, OBJ_ACTUATOR, "base_x_force"),
+    aidBaseY: sim.mujoco.mj_name2id(model, OBJ_ACTUATOR, "base_y_force"),
+    bidBaseY: sim.mujoco.mj_name2id(model, OBJ_BODY, "base_y"),
+    bidStick: sim.mujoco.mj_name2id(model, OBJ_BODY, "stick"),
+    bidWheel: sim.mujoco.mj_name2id(model, OBJ_BODY, "wheel"),
+    bidPayload: sim.mujoco.mj_name2id(model, OBJ_BODY, "payload"),
   };
 }
 
