@@ -2,6 +2,8 @@ import * as THREE from "./vendor/three.module.js";
 import { OrbitControls } from "./vendor/OrbitControls.js";
 import loadMujoco from "./vendor/mujoco_wasm.js";
 
+THREE.Object3D.DEFAULT_UP.set(0, 0, 1);
+
 const SUPPORT_RADIUS_M = 0.145;
 const COM_FAIL_STEPS = 15;
 const CRASH_ANGLE_RAD = 0.43;
@@ -53,7 +55,7 @@ const sim = {
   camera: null,
   renderer: null,
   controls: null,
-  visuals: {},
+  geomVisuals: [],
   raycaster: new THREE.Raycaster(),
   pointerNdc: new THREE.Vector2(),
   dragPlane: new THREE.Plane(new THREE.Vector3(0, 0, 1), 0),
@@ -132,14 +134,16 @@ async function boot() {
 function initThreeScene() {
   sim.scene = new THREE.Scene();
   sim.scene.background = new THREE.Color(0x111a2b);
-  sim.scene.fog = new THREE.Fog(0x111a2b, 3.0, 16.0);
+  sim.scene.fog = new THREE.Fog(0x111a2b, 5.0, 24.0);
 
   sim.camera = new THREE.PerspectiveCamera(48, 1, 0.01, 80);
-  sim.camera.position.set(2.5, -3.3, 1.6);
+  sim.camera.up.set(0, 0, 1);
+  sim.camera.position.set(0.0, -3.8, 1.55);
   sim.camera.lookAt(0.0, 0.0, 0.45);
 
   sim.renderer = new THREE.WebGLRenderer({ canvas: ui.canvas, antialias: true });
   sim.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2.0));
+  sim.renderer.outputColorSpace = THREE.SRGBColorSpace;
   sim.renderer.shadowMap.enabled = true;
   sim.controls = new OrbitControls(sim.camera, sim.renderer.domElement);
   sim.controls.target.set(0.0, 0.0, 0.45);
@@ -147,67 +151,16 @@ function initThreeScene() {
   sim.controls.enablePan = true;
   sim.controls.minDistance = 0.7;
   sim.controls.maxDistance = 12.0;
+  sim.controls.minPolarAngle = 0.06;
+  sim.controls.maxPolarAngle = Math.PI * 0.49;
 
   const keyLight = new THREE.DirectionalLight(0xffffff, 1.1);
   keyLight.position.set(2.2, -2.2, 4.0);
   keyLight.castShadow = true;
   sim.scene.add(keyLight);
-  sim.scene.add(new THREE.AmbientLight(0x89a9cf, 0.45));
+  sim.scene.add(new THREE.AmbientLight(0x89a9cf, 0.52));
 
-  const groundGeo = new THREE.PlaneGeometry(12, 12);
-  const groundMat = new THREE.MeshStandardMaterial({ color: 0x33414f, roughness: 0.9, metalness: 0.05 });
-  const ground = new THREE.Mesh(groundGeo, groundMat);
-  ground.rotation.x = -Math.PI * 0.5;
-  ground.receiveShadow = true;
-  sim.scene.add(ground);
-
-  const grid = new THREE.GridHelper(10, 40, 0x6ad6c9, 0x3a5067);
-  grid.position.y = 0.001;
-  sim.scene.add(grid);
-
-  const baseGroup = new THREE.Group();
-  const baseMesh = new THREE.Mesh(
-    new THREE.BoxGeometry(0.32, 0.24, 0.1),
-    new THREE.MeshStandardMaterial({ color: 0x2f8ded, roughness: 0.5, metalness: 0.25 }),
-  );
-  baseMesh.castShadow = true;
-  baseGroup.add(baseMesh);
-
-  const stickGroup = new THREE.Group();
-  const stickMesh = new THREE.Mesh(
-    new THREE.CylinderGeometry(0.045, 0.045, 0.5, 22),
-    new THREE.MeshStandardMaterial({ color: 0xf2574d, roughness: 0.5, metalness: 0.12 }),
-  );
-  stickMesh.position.z = 0.25;
-  stickMesh.rotation.x = Math.PI * 0.5;
-  stickMesh.castShadow = true;
-  stickGroup.add(stickMesh);
-
-  const wheelGroup = new THREE.Group();
-  const wheelMesh = new THREE.Mesh(
-    new THREE.CylinderGeometry(0.2, 0.2, 0.06, 32),
-    new THREE.MeshStandardMaterial({ color: 0xb99c68, roughness: 0.38, metalness: 0.48 }),
-  );
-  wheelMesh.rotation.z = Math.PI * 0.5;
-  wheelMesh.castShadow = true;
-  wheelGroup.add(wheelMesh);
-
-  const payloadGroup = new THREE.Group();
-  const payloadMesh = new THREE.Mesh(
-    new THREE.BoxGeometry(0.12, 0.12, 0.06),
-    new THREE.MeshStandardMaterial({ color: 0xffbe52, roughness: 0.42, metalness: 0.12 }),
-  );
-  payloadMesh.castShadow = true;
-  payloadGroup.add(payloadMesh);
-
-  sim.scene.add(baseGroup, stickGroup, wheelGroup, payloadGroup);
-  sim.visuals = {
-    base: baseGroup,
-    stick: stickGroup,
-    wheel: wheelGroup,
-    payload: payloadGroup,
-  };
-  sim.robotDropTargets = [baseMesh, stickMesh, wheelMesh, payloadMesh];
+  sim.robotDropTargets = [];
 
   onResize();
 }
@@ -328,8 +281,7 @@ function spawnRandomGroundProp() {
   mesh.castShadow = true;
   mesh.receiveShadow = true;
   if (pick === 2) {
-    mesh.rotation.z = Math.PI * 0.5;
-    mesh.rotation.y = rand(0, Math.PI);
+    mesh.rotation.z = rand(0.0, Math.PI);
   }
   const angle = rand(0, Math.PI * 2.0);
   const radiusRing = rand(0.45, 2.1);
@@ -382,6 +334,7 @@ async function rebuildSimulation(requestedMassKg) {
   sim.data = new sim.mujoco.MjData(sim.model);
   sim.ids = resolveIds(sim.model);
   setPayloadMassRuntime(sim.effectiveMassKg);
+  buildGeomVisualsFromModel();
   resetState();
 
   sim.failed = false;
@@ -448,6 +401,157 @@ function resolveIds(model) {
     bidPayload: sim.mujoco.mj_name2id(model, OBJ_BODY, "payload"),
     gidPayloadGeom: sim.mujoco.mj_name2id(model, OBJ_GEOM, "payload_geom"),
   };
+}
+
+function clearGeomVisuals() {
+  for (const entry of sim.geomVisuals) {
+    const mesh = entry.mesh;
+    if (mesh.parent) {
+      mesh.parent.remove(mesh);
+    }
+    mesh.geometry.dispose();
+    mesh.material.dispose();
+  }
+  sim.geomVisuals = [];
+  sim.robotDropTargets = [];
+}
+
+function buildGeomVisualsFromModel() {
+  if (!sim.model || !sim.scene) {
+    return;
+  }
+  clearGeomVisuals();
+  const OBJ_BODY = sim.mujoco.mjtObj.mjOBJ_BODY.value;
+  for (let gid = 0; gid < sim.model.ngeom; gid += 1) {
+    const type = Number(sim.model.geom_type[gid]);
+    const bodyId = Number(sim.model.geom_bodyid[gid]);
+    const style = getGeomStyle(gid);
+    if (style.alpha <= 0.01) {
+      continue;
+    }
+    const s = 3 * gid;
+    const sx = Number(sim.model.geom_size[s + 0]);
+    const sy = Number(sim.model.geom_size[s + 1]);
+    const sz = Number(sim.model.geom_size[s + 2]);
+    const mesh = createMeshForGeom(type, sx, sy, sz, style);
+    if (!mesh) {
+      continue;
+    }
+    mesh.castShadow = type !== 0;
+    mesh.receiveShadow = true;
+    sim.scene.add(mesh);
+
+    const lp = 3 * gid;
+    const lq = 4 * gid;
+    sim.geomVisuals.push({
+      mesh,
+      geomId: gid,
+      bodyId,
+      localPos: new THREE.Vector3(
+        Number(sim.model.geom_pos[lp + 0]),
+        Number(sim.model.geom_pos[lp + 1]),
+        Number(sim.model.geom_pos[lp + 2]),
+      ),
+      localQuat: normalizeQuat(
+        quatFromMujocoWxyz(
+          Number(sim.model.geom_quat[lq + 0]),
+          Number(sim.model.geom_quat[lq + 1]),
+          Number(sim.model.geom_quat[lq + 2]),
+          Number(sim.model.geom_quat[lq + 3]),
+        ),
+      ),
+    });
+
+    const bodyName = sim.mujoco.mj_id2name(sim.model, OBJ_BODY, bodyId) || "";
+    if (isRobotBodyName(bodyName) && type !== 0) {
+      sim.robotDropTargets.push(mesh);
+    }
+  }
+}
+
+function getGeomStyle(gid) {
+  const rgbaIndex = 4 * gid;
+  let r = Number(sim.model.geom_rgba[rgbaIndex + 0]);
+  let g = Number(sim.model.geom_rgba[rgbaIndex + 1]);
+  let b = Number(sim.model.geom_rgba[rgbaIndex + 2]);
+  let a = Number(sim.model.geom_rgba[rgbaIndex + 3]);
+  let roughness = 0.52;
+  let metalness = 0.16;
+
+  const matId = Number(sim.model.geom_matid[gid]);
+  if (matId >= 0 && sim.model.mat_rgba) {
+    const m = 4 * matId;
+    r *= Number(sim.model.mat_rgba[m + 0]);
+    g *= Number(sim.model.mat_rgba[m + 1]);
+    b *= Number(sim.model.mat_rgba[m + 2]);
+    a *= Number(sim.model.mat_rgba[m + 3]);
+    if (sim.model.mat_shininess) {
+      roughness = clamp(1.0 - Number(sim.model.mat_shininess[matId]) * 0.85, 0.05, 0.98);
+    }
+    if (sim.model.mat_specular) {
+      metalness = clamp(Number(sim.model.mat_specular[matId]) * 0.28, 0.0, 0.42);
+    }
+  }
+
+  return {
+    color: new THREE.Color(clamp(r, 0, 1), clamp(g, 0, 1), clamp(b, 0, 1)),
+    alpha: clamp(a, 0, 1),
+    roughness,
+    metalness,
+  };
+}
+
+function createMeshForGeom(type, sx, sy, sz, style) {
+  let geometry = null;
+  if (type === 0) {
+    geometry = new THREE.PlaneGeometry(Math.max(2 * sx, 20.0), Math.max(2 * sy, 20.0));
+  } else if (type === 2) {
+    geometry = new THREE.SphereGeometry(Math.max(sx, 1e-4), 22, 16);
+  } else if (type === 3) {
+    geometry = new THREE.CapsuleGeometry(Math.max(sx, 1e-4), Math.max(2 * sy, 1e-4), 8, 16);
+    geometry.rotateX(Math.PI * 0.5);
+  } else if (type === 5) {
+    geometry = new THREE.CylinderGeometry(Math.max(sx, 1e-4), Math.max(sx, 1e-4), Math.max(2 * sy, 1e-4), 24);
+    geometry.rotateX(Math.PI * 0.5);
+  } else if (type === 6) {
+    geometry = new THREE.BoxGeometry(Math.max(2 * sx, 1e-4), Math.max(2 * sy, 1e-4), Math.max(2 * sz, 1e-4));
+  } else {
+    return null;
+  }
+  const material = new THREE.MeshStandardMaterial({
+    color: style.color,
+    roughness: style.roughness,
+    metalness: style.metalness,
+    transparent: style.alpha < 0.999,
+    opacity: style.alpha,
+    side: type === 0 ? THREE.DoubleSide : THREE.FrontSide,
+  });
+  if (style.alpha <= 0.01) {
+    material.visible = false;
+  }
+  return new THREE.Mesh(geometry, material);
+}
+
+function quatFromMujocoWxyz(w, x, y, z) {
+  return new THREE.Quaternion(x, y, z, w);
+}
+
+function normalizeQuat(q) {
+  if (q.lengthSq() < 1e-12) {
+    return q.identity();
+  }
+  return q.normalize();
+}
+
+function isRobotBodyName(name) {
+  return (
+    name === "base_x" ||
+    name === "base_y" ||
+    name === "stick_pitch_frame" ||
+    name === "stick" ||
+    name === "wheel" ||
+    name === "payload"
+  );
 }
 
 function setPayloadMassRuntime(payloadMassKg) {
@@ -586,26 +690,47 @@ function animate() {
 }
 
 function syncVisuals() {
-  applyBodyPose(sim.visuals.base, sim.ids.bidBaseY);
-  applyBodyPose(sim.visuals.stick, sim.ids.bidStick);
-  applyBodyPose(sim.visuals.wheel, sim.ids.bidWheel);
-  applyBodyPose(sim.visuals.payload, sim.ids.bidPayload);
-}
+  const hasGeomWorld = Boolean(sim.data.geom_xpos) && Boolean(sim.data.geom_xmat);
+  const rot = new THREE.Matrix4();
 
-function applyBodyPose(object3d, bodyId) {
-  const base3 = 3 * bodyId;
-  const base4 = 4 * bodyId;
-  object3d.position.set(
-    sim.data.xpos[base3],
-    sim.data.xpos[base3 + 1],
-    sim.data.xpos[base3 + 2],
-  );
-  object3d.quaternion.set(
-    sim.data.xquat[base4 + 1],
-    sim.data.xquat[base4 + 2],
-    sim.data.xquat[base4 + 3],
-    sim.data.xquat[base4],
-  );
+  for (const entry of sim.geomVisuals) {
+    if (hasGeomWorld) {
+      const g3 = 3 * entry.geomId;
+      const g9 = 9 * entry.geomId;
+      const gx = Number(sim.data.geom_xpos[g3 + 0]);
+      const gy = Number(sim.data.geom_xpos[g3 + 1]);
+      const gz = Number(sim.data.geom_xpos[g3 + 2]);
+      rot.set(
+        Number(sim.data.geom_xmat[g9 + 0]), Number(sim.data.geom_xmat[g9 + 1]), Number(sim.data.geom_xmat[g9 + 2]), 0,
+        Number(sim.data.geom_xmat[g9 + 3]), Number(sim.data.geom_xmat[g9 + 4]), Number(sim.data.geom_xmat[g9 + 5]), 0,
+        Number(sim.data.geom_xmat[g9 + 6]), Number(sim.data.geom_xmat[g9 + 7]), Number(sim.data.geom_xmat[g9 + 8]), 0,
+        0, 0, 0, 1,
+      );
+      entry.mesh.position.set(gx, gy, gz);
+      entry.mesh.quaternion.setFromRotationMatrix(rot);
+      continue;
+    }
+
+    const b3 = 3 * entry.bodyId;
+    const b4 = 4 * entry.bodyId;
+    const bodyPos = new THREE.Vector3(
+      Number(sim.data.xpos[b3 + 0]),
+      Number(sim.data.xpos[b3 + 1]),
+      Number(sim.data.xpos[b3 + 2]),
+    );
+    const bodyQuat = normalizeQuat(
+      quatFromMujocoWxyz(
+        Number(sim.data.xquat[b4 + 0]),
+        Number(sim.data.xquat[b4 + 1]),
+        Number(sim.data.xquat[b4 + 2]),
+        Number(sim.data.xquat[b4 + 3]),
+      ),
+    );
+    const worldPos = entry.localPos.clone().applyQuaternion(bodyQuat).add(bodyPos);
+    const worldQuat = bodyQuat.clone().multiply(entry.localQuat);
+    entry.mesh.position.copy(worldPos);
+    entry.mesh.quaternion.copy(worldQuat);
+  }
 }
 
 function updateHud() {
