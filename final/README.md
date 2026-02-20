@@ -110,6 +110,83 @@ Where:
 
 Terrain friction matters too: if contact is poor, base motion helps less.
 
+## 3.5)  System Dynamics & State-Space Model
+
+This is the **linearized reaction wheel balancer system** around the upright equilibrium. It's the mathematical abstraction of the robot's physics that the controller must stabilize.
+
+### Physical Components
+
+- **Reaction wheel**: A motor-driven spinning wheel that applies corrective torque to the tilt angles
+- **Inverted pendulum (stick)**: The main body that wants to fall; must stay upright
+- **Wheeled base (X/Y platform)**: A 2D translating platform that shifts to help balance
+
+### State Vector (9-Dimensional)
+
+The state is:
+```
+x = [pitch,            # Tilt forward/backward (radians)
+     roll,             # Tilt side-to-side (radians)
+     pitch_rate,       # Forward tilt velocity (rad/s)
+     roll_rate,        # Side tilt velocity (rad/s)
+     wheel_rate,       # Reaction wheel speed (rad/s)
+     base_x,           # Platform position X (meters)
+     base_y,           # Platform position Y (meters)
+     base_vel_x,       # Platform velocity X (m/s)
+     base_vel_y]       # Platform velocity Y (m/s)
+```
+
+### Control Inputs (3-Dimensional)
+
+```
+u = [wheel_torque,     # Reaction wheel torque (Nm, ±80 limit)
+     base_x_force,     # Platform X force (N, ±10 limit)
+     base_y_force]     # Platform Y force (N, ±10 limit)
+```
+
+### Linearized Dynamics
+
+Then it is governed by discrete-time linear dynamics:
+```
+x_{k+1} = A · x_k + B · u_k
+```
+
+where:
+- **A** is the 9×9 state transition matrix (from finite-difference linearization around equilibrium)
+- **B** is the 9×3 control input matrix
+
+### The Problem: Marginally Stable Poles
+
+The eigenvalues of A are:
+```
+λ = [1.0, 1.0, 0.968, 0.786, 0.817, 0.946, 1.008, 0.999, 0.988]
+     ↑↑
+   **Two poles exactly at λ=1.0 (marginally stable)**
+```
+
+These integrator poles mean:
+- The system does **not naturally decay** to equilibrium on its own
+- Even perfect measurements and infinite precision cannot prevent eventual drift
+- Sensor noise, discretization errors, and model mismatch cause permanent divergence
+- The COM (center of mass) periodically exceeds the 0.145m support radius, triggering crashes
+
+**Result**: ~1,300–1,600 crashes per 5–6 million simulated steps at 1 kHz, regardless of whether using LQR or MPC.
+
+### Control Constraints
+
+The controller must respect:
+- **COM boundary**: sqrt(base_x² + base_y²) ≤ 0.145 m (hard limit for support)
+- **Angle limits**: |pitch|, |roll| ≤ 0.436 rad (~25°) before crash detection
+- **Input saturation**: |u| ≤ [80, 10, 10] Nm/N
+- **Receding horizon**: Only 100 ms (25 control steps) of prediction
+
+### Why This Matters for Control Design
+
+1. **LQR alone is insufficient**: Standard feedback gain cannot overcome integrator poles and fundamental drift
+2. **MPC with hard constraints**: Embeds the COM boundary directly in the optimization to preemptively stay safe, rather than reacting after the fact
+3. **Fundamental limits**: No single control law can eliminate all crashes; the system reaches its physical limits with the given support radius
+
+This is why the MPC implementation focuses on **constraint satisfaction** rather than just error minimization.
+
 ## 4) Control Law (How Software Actually Stabilizes It)
 
 Every control update in `final/final.py` does:
