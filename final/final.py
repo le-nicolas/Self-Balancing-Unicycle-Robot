@@ -147,7 +147,51 @@ def main():
                 f"{name}: xml=[{XML_CTRL_LOW[i]:.3f}, {XML_CTRL_HIGH[i]:.3f}] vs python=+/-{cfg.max_u[i]:.3f}"
             )
 
+    # 5) Initialize MPC controller if enabled
+    mpc_controller = None
+    if cfg.use_mpc:
+        try:
+            from mpc_controller import MPCController
+            # Build MPC cost matrices based on config
+            q_diag = np.array([
+                cfg.mpc_q_angles,                    # pitch
+                cfg.mpc_q_angles,                    # roll
+                cfg.mpc_q_rates,                     # pitch_rate
+                cfg.mpc_q_rates,                     # roll_rate
+                1.0,                                 # wheel_rate (low penalty)
+                cfg.mpc_q_position,                  # base_x
+                cfg.mpc_q_position,                  # base_y
+                cfg.mpc_q_rates,                     # base_vel_x
+                cfg.mpc_q_rates,                     # base_vel_y
+            ])
+            r_diag = np.array([
+                cfg.mpc_r_control,                   # wheel_torque
+                cfg.mpc_r_control,                   # base_x_force
+                cfg.mpc_r_control,                   # base_y_force
+            ])
+            mpc_controller = MPCController(
+                A=A,
+                B=B,
+                horizon=cfg.mpc_horizon,
+                q_diag=q_diag,
+                r_diag=r_diag,
+                u_max=cfg.max_u,
+                com_radius_m=cfg.mpc_com_constraint_radius_m,
+                angle_max_rad=cfg.crash_angle_rad,
+                verbose=cfg.mpc_verbose,
+            )
+            print("\n=== MPC CONTROLLER INITIALIZED ===")
+            print(f"Horizon: {cfg.mpc_horizon} steps ({cfg.mpc_horizon / cfg.control_hz * 1000:.1f} ms)")
+            print(f"Q diagonal: angles={cfg.mpc_q_angles}, rates={cfg.mpc_q_rates}, pos={cfg.mpc_q_position}")
+            print(f"R diagonal: control={cfg.mpc_r_control}")
+            print(f"COM constraint radius: {cfg.mpc_com_constraint_radius_m:.3f} m")
+        except Exception as e:
+            print(f"\nWarning: MPC initialization failed: {e}")
+            print("Falling back to LQR control")
+            mpc_controller = None
+
     print("\n=== LINEARIZATION ===")
+
     print(f"A shape: {A.shape}, B shape: {B.shape}")
     print(f"A eigenvalues: {np.linalg.eigvals(A)}")
     print("\n=== DELTA-U LQR ===")
@@ -516,6 +560,7 @@ def main():
                     K_paper_pitch=K_paper_pitch,
                     du_hits=du_hits,
                     sat_hits=sat_hits,
+                    mpc_controller=mpc_controller,
                 )
                 residual_step = residual_policy.step(
                     x_est=x_est,

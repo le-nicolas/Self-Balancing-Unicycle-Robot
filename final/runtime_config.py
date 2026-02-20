@@ -117,6 +117,14 @@ class RuntimeConfig:
     wheel_only_max_u: float
     wheel_only_max_du: float
     wheel_only_int_clamp: float
+    use_mpc: bool
+    mpc_horizon: int
+    mpc_q_angles: float
+    mpc_q_rates: float
+    mpc_q_position: float
+    mpc_r_control: float
+    mpc_com_constraint_radius_m: float
+    mpc_verbose: bool
 
 
 
@@ -265,6 +273,46 @@ def parse_args(argv=None):
     parser.add_argument("--disturbance-interval", type=int, default=None)
     parser.add_argument("--control-hz", type=float, default=250.0)
     parser.add_argument("--control-delay-steps", type=int, default=1)
+    parser.add_argument(
+        "--use-mpc",
+        action="store_true",
+        help="Use Model Predictive Control with hard COM position constraints instead of LQR.",
+    )
+    parser.add_argument(
+        "--mpc-horizon",
+        type=int,
+        default=25,
+        help="MPC prediction horizon in steps (25 steps = 100ms at 250Hz).",
+    )
+    parser.add_argument(
+        "--mpc-q-angles",
+        type=float,
+        default=200.0,
+        help="MPC cost weight for pitch/roll angle errors.",
+    )
+    parser.add_argument(
+        "--mpc-q-rates",
+        type=float,
+        default=100.0,
+        help="MPC cost weight for pitch/roll rate errors.",
+    )
+    parser.add_argument(
+        "--mpc-q-position",
+        type=float,
+        default=50.0,
+        help="MPC cost weight for base position errors.",
+    )
+    parser.add_argument(
+        "--mpc-r-control",
+        type=float,
+        default=0.5,
+        help="MPC cost weight for control effort.",
+    )
+    parser.add_argument(
+        "--mpc-verbose",
+        action="store_true",
+        help="Print MPC solver diagnostics.",
+    )
     parser.add_argument("--wheel-encoder-ticks", type=int, default=2048)
     parser.add_argument("--imu-angle-noise-deg", type=float, default=0.25)
     parser.add_argument("--imu-rate-noise", type=float, default=0.02)
@@ -397,14 +445,14 @@ def build_config(args) -> RuntimeConfig:
         ki_base = 0.22991644116687834
         u_bleed = 0.9310825140555963
         base_force_soft_limit = 10.0
-        base_damping_gain = 12.0
-        base_centering_gain = 12.0
+        base_damping_gain = 5.0
+        base_centering_gain = 1.0
         base_tilt_deadband_deg = 0.4
         base_tilt_full_authority_deg = 1.8
         base_command_gain = 0.70
         base_centering_pos_clip_m = 0.25
         base_speed_soft_limit_frac = 0.55
-        base_hold_radius_m = 0.08
+        base_hold_radius_m = 0.15
         base_ref_follow_rate_hz = 5.5
         base_ref_recenter_rate_hz = 0.90
         base_authority_rate_per_s = 1.8
@@ -432,14 +480,14 @@ def build_config(args) -> RuntimeConfig:
         ki_base = 1.6
         u_bleed = 0.94
         base_force_soft_limit = 12.0
-        base_damping_gain = 10.0
-        base_centering_gain = 10.0
+        base_damping_gain = 6.0
+        base_centering_gain = 1.5
         base_tilt_deadband_deg = 0.5
         base_tilt_full_authority_deg = 2.0
         base_command_gain = 0.60
         base_centering_pos_clip_m = 0.20
         base_speed_soft_limit_frac = 0.70
-        base_hold_radius_m = 0.10
+        base_hold_radius_m = 0.15
         base_ref_follow_rate_hz = 9.0
         base_ref_recenter_rate_hz = 0.40
         base_authority_rate_per_s = 2.4
@@ -752,7 +800,12 @@ def build_config(args) -> RuntimeConfig:
         wheel_only_max_u=wheel_only_max_u,
         wheel_only_max_du=wheel_only_max_du,
         wheel_only_int_clamp=0.35,
+        use_mpc=bool(getattr(args, "use_mpc", False)),
+        mpc_horizon=int(max(getattr(args, "mpc_horizon", 25), 5)),
+        mpc_q_angles=float(max(getattr(args, "mpc_q_angles", 200.0), 1.0)),
+        mpc_q_rates=float(max(getattr(args, "mpc_q_rates", 100.0), 1.0)),
+        mpc_q_position=float(max(getattr(args, "mpc_q_position", 50.0), 1.0)),
+        mpc_r_control=float(max(getattr(args, "mpc_r_control", 0.5), 0.01)),
+        mpc_com_constraint_radius_m=payload_support_radius_m,
+        mpc_verbose=bool(getattr(args, "mpc_verbose", False)),
     )
-
-
-

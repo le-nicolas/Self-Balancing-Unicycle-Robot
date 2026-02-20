@@ -4,6 +4,13 @@ import numpy as np
 
 from runtime_config import RuntimeConfig
 
+try:
+    from mpc_controller import MPCController
+    MPC_AVAILABLE = True
+except ImportError:
+    MPC_AVAILABLE = False
+    MPCController = None
+
 
 def reset_controller_buffers(nx: int, nu: int, queue_len: int):
     x_est = np.zeros(nx)
@@ -128,6 +135,7 @@ def _init_control_terms() -> dict[str, np.ndarray]:
         "term_despin": np.zeros(3, dtype=float),
         "term_base_hold": np.zeros(3, dtype=float),
         "term_safety_shaping": np.zeros(3, dtype=float),
+        "term_mpc": np.zeros(3, dtype=float),
     }
 
 
@@ -157,6 +165,7 @@ def compute_control_command(
     K_paper_pitch: np.ndarray | None,
     du_hits: np.ndarray,
     sat_hits: np.ndarray,
+    mpc_controller: "MPCController | None" = None,
 ):
     """Controller core: delta-u LQR + wheel-only mode + base policy + safety shaping."""
     wheel_over_budget = False
@@ -172,6 +181,43 @@ def compute_control_command(
     else:
         base_int[:] = 0.0
 
+    # ========== MPC PATH (if enabled) ==========
+    if cfg.use_mpc and mpc_controller is not None:
+        # MPC solves the constrained optimization problem directly
+        u_mpc, mpc_info = mpc_controller.solve(x_ctrl)
+        
+        # Clip and apply MPC output
+        u_rw_cmd = float(np.clip(u_mpc[0], -cfg.max_u[0], cfg.max_u[0]))
+        u_base_cmd = np.clip(u_mpc[1:], -cfg.max_u[1:], cfg.max_u[1:])
+        
+        # Record to terms for logging
+        terms["term_mpc"] = u_mpc
+        
+        # Handle saturation hits
+        sat_hits[0] += int(abs(u_mpc[0]) > cfg.max_u[0])
+        sat_hits[1:] += (np.abs(u_mpc[1:]) > cfg.max_u[1:]).astype(int)
+        
+        # Return MPC result in same format as LQR path
+        u_cmd = np.array([u_rw_cmd, u_base_cmd[0], u_base_cmd[1]], dtype=float)
+        rw_u_limit = cfg.max_u[0]
+        wheel_over_budget = False  # MPC handles constraints explicitly
+        wheel_over_hard = False
+        
+        return (
+            u_cmd,
+            base_int,
+            base_ref,
+            base_authority_state,
+            u_base_smooth,
+            wheel_pitch_int,
+            rw_u_limit,
+            wheel_over_budget,
+            wheel_over_hard,
+            high_spin_active,
+            terms,
+        )
+
+    # ========== DEFAULT LQR PATH ==========
     # Use effective applied command in delta-u state to avoid windup when
     # saturation/delay/motor limits differ from requested command.
     z = np.concatenate([x_ctrl, u_eff_applied])
@@ -371,8 +417,23 @@ def compute_control_command(
     u_rw_cmd = float(np.clip(u_rw_cmd, -rw_u_limit, rw_u_limit))
 
     if cfg.allow_base_motion:
-        # Always enable base authority for balance stabilization; reduce deadband effect
-        base_authority = 1.0
+        # Restore deadband-based blending: hold mode (position centering) at small angles, 
+        # balance mode (pitch stabilization) at larger angles
+        tilt_mag = max(abs(float(x_est[0])), abs(float(x_est[1])))
+        tilt_span = 0.10  # 5.7 degrees
+        base_tilt_deadband_rad = 0.40 * np.pi / 180  # 0.4 degrees (0.00698 rad)
+        base_authority_raw = float(np.clip((tilt_mag - base_tilt_deadband_rad) / tilt_span, 0.0, 1.0))
+        # Smooth authority with first-order filter
+        base_authority_tau = 0.1  # 100ms time constant
+        base_authority_alpha = float(np.clip(control_dt / (base_authority_tau + control_dt), 0.0, 1.0))
+        if not hasattr(compute_control_command, '_base_authority_filtered'):
+            compute_control_command._base_authority_filtered = 0.0
+        compute_control_command._base_authority_filtered = (
+            base_authority_alpha * base_authority_raw + 
+            (1.0 - base_authority_alpha) * compute_control_command._base_authority_filtered
+        )
+        base_authority = float(np.clip(compute_control_command._base_authority_filtered, 0.0, 1.0))
+        
         follow_alpha = float(np.clip(cfg.base_ref_follow_rate_hz * control_dt, 0.0, 1.0))
         recenter_alpha = float(np.clip(cfg.base_ref_recenter_rate_hz * control_dt, 0.0, 1.0))
         base_disp = float(np.hypot(x_est[5], x_est[6]))
