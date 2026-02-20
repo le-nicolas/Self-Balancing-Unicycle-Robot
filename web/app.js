@@ -160,8 +160,8 @@ function initThreeScene() {
   sim.controls.enablePan = true;
   sim.controls.minDistance = 0.7;
   sim.controls.maxDistance = 12.0;
-  sim.controls.minPolarAngle = 0.06;
-  sim.controls.maxPolarAngle = Math.PI * 0.49;
+  sim.controls.minPolarAngle = 0.01;
+  sim.controls.maxPolarAngle = Math.PI - 0.01;
 
   const keyLight = new THREE.DirectionalLight(0xffffff, 1.1);
   keyLight.position.set(2.2, -2.2, 4.0);
@@ -439,11 +439,16 @@ function buildGeomVisualsFromModel() {
     return;
   }
   clearGeomVisuals();
-  const OBJ_BODY = sim.mujoco.mjtObj.mjOBJ_BODY.value;
+  const OBJ_BODY = enumToInt(sim.mujoco.mjtObj.mjOBJ_BODY);
+  const OBJ_GEOM = enumToInt(sim.mujoco.mjtObj.mjOBJ_GEOM);
 
   for (let gid = 0; gid < sim.model.ngeom; gid += 1) {
     const type = Number(sim.model.geom_type[gid]);
     const bodyId = Number(sim.model.geom_bodyid[gid]);
+    const geomName = sim.mujoco.mj_id2name(sim.model, OBJ_GEOM, gid) || "";
+    if (geomName === "payload_geom") {
+      continue;
+    }
     const style = getGeomStyle(gid);
     if (style.alpha <= 0.01) {
       continue;
@@ -630,6 +635,20 @@ function clamp(value, min, max) {
 
 function rand(min, max) {
   return min + Math.random() * (max - min);
+}
+
+function enumToInt(value) {
+  if (typeof value === "number" && Number.isInteger(value)) {
+    return value;
+  }
+  if (value && typeof value.value === "number" && Number.isInteger(value.value)) {
+    return value.value;
+  }
+  const parsed = Number(value?.valueOf?.() ?? value);
+  if (Number.isInteger(parsed)) {
+    return parsed;
+  }
+  throw new Error(`Cannot convert enum "${String(value)}" to int`);
 }
 
 async function withTimeout(promise, timeoutMs, timeoutMessage) {

@@ -87,7 +87,7 @@ def main():
     reset_state(model, data, ids.q_pitch, ids.q_roll, pitch_eq=0.0, roll_eq=initial_roll_rad)
 
     # 3) Linearize XML-defined dynamics about upright and build controller gains.
-    nx = model.nq + model.nv
+    nx = 2 * model.nv + model.na
     nu = model.nu
     A_full = np.zeros((nx, nx))
     B_full = np.zeros((nx, nu))
@@ -96,13 +96,13 @@ def main():
     idx = [
         ids.q_pitch,
         ids.q_roll,
-        model.nq + ids.v_pitch,
-        model.nq + ids.v_roll,
-        model.nq + ids.v_rw,
+        model.nv + ids.v_pitch,
+        model.nv + ids.v_roll,
+        model.nv + ids.v_rw,
         ids.q_base_x,
         ids.q_base_y,
-        model.nq + ids.v_base_x,
-        model.nq + ids.v_base_y,
+        model.nv + ids.v_base_x,
+        model.nv + ids.v_base_y,
     ]
     A = A_full[np.ix_(idx, idx)]
     B = B_full[np.ix_(idx, [ids.aid_rw, ids.aid_base_x, ids.aid_base_y])]

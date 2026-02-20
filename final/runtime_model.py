@@ -97,6 +97,9 @@ def reset_state(model, data, q_pitch, q_roll, pitch_eq=0.0, roll_eq=0.0):
     data.qpos[:] = 0.0
     data.qvel[:] = 0.0
     data.ctrl[:] = 0.0
+    # Fix invalid quaternion in freejoint (indices 3:7)
+    data.qpos[3] = 1.0  # w component of quaternion (identity rotation)
+    data.qpos[4:7] = 0.0  # x, y, z components
     data.qpos[q_pitch] = pitch_eq
     data.qpos[q_roll] = roll_eq
     mujoco.mj_forward(model, data)
