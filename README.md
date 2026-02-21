@@ -23,14 +23,16 @@ It is written for two audiences:
 - `meshes/`: shared geometry assets.
 - `docs/`: workflow and analysis documentation.
 - `archive/`: legacy prototypes and historical logs moved out of the root.
+- `archive/legacy/scripts/README.md`: per-script intent map for archived iteration files.
 - `web/`: browser viewer side quest.
-- `wheel-base-controller-release/`: standalone minimal wheel+base package snapshot.
+- `wheel-base-controller-release/`: standalone minimal wheel-and-base package snapshot.
 
 ## 0.5) Current Status and Transparency (as of 2026-02-21)
 
 - This repo is an active research/dev sandbox, not a frozen release.
 - The only actively maintained control stack is under `final/`.
 - Historical files/prototypes are retained in `archive/` for traceability, not as recommended entry points.
+- Legacy script intents are indexed in `archive/legacy/scripts/README.md` so canonical vs historical files are explicit.
 - The benchmark table in this README (`2026-02-21` snapshot) is a reproducible reference point, not a claim that all newer stress cases are solved.
 - Recent fixed-seed stress diagnostics (`seed=42`, 80 episodes, high disturbance profile) are stored in:
   - `final/results/throughput_ablation_seed42.json`
@@ -161,6 +163,7 @@ Mode shown below: `mode_default / nominal / default`
 | `paper_split_baseline` | 1.000 | 0.000 | 69.169 |
 
 `baseline_mpc` is still a comparator baseline, not the default deployment path.
+Historical note: an earlier artifact (`final/results/benchmark_20260216_011044.csv`, generated 2026-02-16) recorded `baseline_mpc` crash rate `0.375`; current tuned defaults in this snapshot are improved.
 Longer and harsher profiles can still separate controllers even when this fast smoke profile passes for all families.
 
 ### 2.4 Reproducibility
@@ -220,6 +223,8 @@ python final/final.py --mode smooth --residual-model path/to/residual.pt --resid
 ```
 Training and deployment details:
 - `docs/RESIDUAL_MODEL_GUIDE.md`
+- `final/build_residual_dataset.py`
+- `final/train_residual_model.py`
 
 Central runtime tuning file:
 - `final/config.yaml` (auto-loaded when present; override with `--config path/to/config.yaml`)
