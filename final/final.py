@@ -102,6 +102,21 @@ def _controllability_rank(A: np.ndarray, B: np.ndarray) -> int:
     return int(np.linalg.matrix_rank(ctrb))
 
 
+def lift_discrete_dynamics(A: np.ndarray, B: np.ndarray, steps: int) -> tuple[np.ndarray, np.ndarray]:
+    """Zero-order-hold lifting from model-step dynamics to controller update interval."""
+    n = max(int(steps), 1)
+    if n == 1:
+        return A.copy(), B.copy()
+    A_lift = np.linalg.matrix_power(A, n)
+    acc = np.zeros_like(A)
+    Ak = np.eye(A.shape[0], dtype=float)
+    for _ in range(n):
+        acc += Ak
+        Ak = A @ Ak
+    B_lift = acc @ B
+    return A_lift, B_lift
+
+
 def main():
     # 1) Parse CLI and build runtime tuning/safety profile.
     args = parse_args()
@@ -130,11 +145,23 @@ def main():
         "base_x": ids.base_x_body_id,
         "payload": ids.payload_body_id,
     }[args.push_body]
-    reset_state(model, data, ids.q_pitch, ids.q_roll, pitch_eq=0.0, roll_eq=initial_roll_rad)
+    # Linearize around configured operating point (defaults to upright).
+    reset_state(
+        model,
+        data,
+        ids.q_pitch,
+        ids.q_roll,
+        pitch_eq=cfg.linearize_pitch_rad,
+        roll_eq=cfg.linearize_roll_rad,
+    )
     if cfg.lock_root_attitude:
         enforce_planar_root_attitude(model, data, ids)
 
-    # 3) Linearize XML-defined dynamics about upright and build controller gains.
+    # Controller update interval (used to lift model-step A/B to control-step A/B for gain design).
+    control_steps = 1 if not cfg.hardware_realistic else max(1, int(round(1.0 / (model.opt.timestep * cfg.control_hz))))
+    control_dt = control_steps * model.opt.timestep
+
+    # 3) Linearize XML-defined dynamics and build controller gains at control update interval.
     nx = 2 * model.nv + model.na
     nu = model.nu
     A_full = np.zeros((nx, nx))
@@ -153,8 +180,9 @@ def main():
         model.nv + ids.v_base_x,
         model.nv + ids.v_base_y,
     ]
-    A = A_full[np.ix_(idx, idx)]
-    B = B_full[np.ix_(idx, [ids.aid_rw, ids.aid_base_x, ids.aid_base_y])]
+    A_step = A_full[np.ix_(idx, idx)]
+    B_step = B_full[np.ix_(idx, [ids.aid_rw, ids.aid_base_x, ids.aid_base_y])]
+    A, B = lift_discrete_dynamics(A_step, B_step, control_steps)
     NX = A.shape[0]
     NU = B.shape[1]
     B_pinv = np.linalg.pinv(B)
@@ -186,8 +214,6 @@ def main():
             K_wheel_only = np.array([[cfg.wheel_only_pitch_kp, cfg.wheel_only_pitch_kd, 0.0]], dtype=float)
 
     # 4) Build estimator model from configured sensor channels/noise.
-    control_steps = 1 if not cfg.hardware_realistic else max(1, int(round(1.0 / (model.opt.timestep * cfg.control_hz))))
-    control_dt = control_steps * model.opt.timestep
     adaptive_scheduler = None
     adaptive_prev_x_est = None
     if (
@@ -304,6 +330,11 @@ def main():
         print("Warning: model has uncontrollable modes (drift can remain despite tuning).")
     print("\n=== DELTA-U LQR ===")
     print(f"K_du shape: {K_du.shape}")
+    print(
+        "Linearization operating point: "
+        f"pitch={np.degrees(cfg.linearize_pitch_rad):.2f}deg "
+        f"roll={np.degrees(cfg.linearize_roll_rad):.2f}deg"
+    )
     print(f"controller_family={cfg.controller_family}")
     if K_wheel_only is not None:
         print(f"wheel_only_K: {K_wheel_only}")
@@ -323,6 +354,11 @@ def main():
     print(
         f"hardware_realistic={cfg.hardware_realistic} control_hz={cfg.control_hz:.1f} "
         f"delay_steps={cfg.control_delay_steps} wheel_ticks={cfg.wheel_encoder_ticks_per_rev}"
+    )
+    print(
+        f"dynamics_dt_model={model.opt.timestep:.6f}s "
+        f"design_dt_control={control_dt:.6f}s "
+        f"(control_steps={control_steps})"
     )
     print(f"Disturbance: magnitude={cfg.disturbance_magnitude}, interval={cfg.disturbance_interval}")
     print(f"base_integrator_enabled={cfg.base_integrator_enabled}")
@@ -718,7 +754,8 @@ def main():
                 reset_sensor_frontend_state(sensor_frontend_state)
                 continue
 
-            x_pred = A @ x_est + B @ u_eff_applied
+            # Estimator predictor runs at simulation step; control gains are designed on lifted control-step model.
+            x_pred = A_step @ x_est + B_step @ u_eff_applied
             x_est = x_pred
 
             if step_count % control_steps == 0:

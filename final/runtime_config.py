@@ -276,6 +276,8 @@ class RuntimeConfig:
     payload_com_fail_steps: int
     x_ref: float
     y_ref: float
+    linearize_pitch_rad: float
+    linearize_roll_rad: float
     int_clamp: float
     upright_angle_thresh: float
     upright_vel_thresh: float
@@ -704,6 +706,18 @@ def parse_args(argv=None):
         type=float,
         default=0.0,
         help="Initial stick tilt in degrees in Y direction (implemented as roll for base_y response).",
+    )
+    parser.add_argument(
+        "--linearize-pitch-deg",
+        type=float,
+        default=0.0,
+        help="Pitch operating point (deg) used for dynamics linearization before LQR/MPC gain construction.",
+    )
+    parser.add_argument(
+        "--linearize-roll-deg",
+        type=float,
+        default=0.0,
+        help="Roll operating point (deg) used for dynamics linearization before LQR/MPC gain construction.",
     )
     parser.add_argument("--crash-angle-deg", type=float, default=25.0)
     parser.add_argument(
@@ -1506,6 +1520,8 @@ def build_config(args) -> RuntimeConfig:
         rw_emergency_du_enabled = False
         rw_emergency_du_scale = 1.0
     hold_base_x_centering_gain = float(max(getattr(args, "hold_base_x_centering_gain", 0.0), 0.0))
+    linearize_pitch_rad = float(np.radians(float(getattr(args, "linearize_pitch_deg", 0.0))))
+    linearize_roll_rad = float(np.radians(float(getattr(args, "linearize_roll_deg", 0.0))))
 
     # Runtime mode resolution: preserve CLI intent with staged real-hardware safety.
     allow_base_motion_requested = bool(args.allow_base_motion)
@@ -1680,6 +1696,8 @@ def build_config(args) -> RuntimeConfig:
         payload_com_fail_steps=payload_com_fail_steps,
         x_ref=0.0,
         y_ref=0.0,
+        linearize_pitch_rad=linearize_pitch_rad,
+        linearize_roll_rad=linearize_roll_rad,
         int_clamp=2.0,
         upright_angle_thresh=np.radians(3.0),
         upright_vel_thresh=0.10,

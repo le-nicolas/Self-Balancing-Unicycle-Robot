@@ -42,6 +42,8 @@ class EpisodeConfig:
     init_roll_deg_override: float | None = None
     init_base_x_m_override: float | None = None
     init_base_y_m_override: float | None = None
+    linearize_pitch_deg: float = 0.0
+    linearize_roll_deg: float = 0.0
     max_worst_tilt_deg: float = 20.0
     max_worst_base_m: float = 4.0
     max_mean_sat_rate_du: float = 0.98
@@ -209,12 +211,27 @@ class ControllerEvaluator:
                 raise RuntimeError(f"{label} linear solve returned non-finite result.")
             return sol
 
+    @staticmethod
+    def _lift_discrete_dynamics(A: np.ndarray, B: np.ndarray, steps: int) -> tuple[np.ndarray, np.ndarray]:
+        n = max(int(steps), 1)
+        if n == 1:
+            return A.copy(), B.copy()
+        A_lift = np.linalg.matrix_power(A, n)
+        acc = np.zeros_like(A)
+        Ak = np.eye(A.shape[0], dtype=float)
+        for _ in range(n):
+            acc += Ak
+            Ak = A @ Ak
+        B_lift = acc @ B
+        return A_lift, B_lift
+
     def __init__(self, xml_path: Path):
         self.model = mujoco.MjModel.from_xml_path(str(xml_path))
         self.data = mujoco.MjData(self.model)
         self.dt = self.model.opt.timestep
 
         self._runtime_cfg_cache: dict[tuple[object, ...], runtime_cfg.RuntimeConfig] = {}
+        self._linearization_cache: dict[tuple[float, float], tuple[np.ndarray, np.ndarray]] = {}
         self._sync_runtime_tuning(self._resolve_runtime_cfg(EpisodeConfig()))
         self._resolve_ids()
         self.A, self.B = self._linearize()
@@ -242,6 +259,8 @@ class ControllerEvaluator:
             round(float(config.rw_emergency_du_scale), 8),
             round(float(config.hold_base_x_centering_gain), 8),
             round(float(config.dob_cutoff_hz), 8),
+            round(float(config.linearize_pitch_deg), 8),
+            round(float(config.linearize_roll_deg), 8),
         )
         cached = self._runtime_cfg_cache.get(key)
         if cached is not None:
@@ -278,6 +297,10 @@ class ControllerEvaluator:
             f"{float(config.rw_emergency_du_scale)}",
             "--hold-base-x-centering-gain",
             f"{float(config.hold_base_x_centering_gain)}",
+            "--linearize-pitch-deg",
+            f"{float(config.linearize_pitch_deg)}",
+            "--linearize-roll-deg",
+            f"{float(config.linearize_roll_deg)}",
             "--controller-family",
             controller_family,
         ]
@@ -299,6 +322,8 @@ class ControllerEvaluator:
     def _sync_runtime_tuning(self, cfg: runtime_cfg.RuntimeConfig) -> None:
         self.X_REF = float(cfg.x_ref)
         self.Y_REF = float(cfg.y_ref)
+        self.LINEARIZE_PITCH_RAD = float(getattr(cfg, "linearize_pitch_rad", 0.0))
+        self.LINEARIZE_ROLL_RAD = float(getattr(cfg, "linearize_roll_rad", 0.0))
         self.INT_CLAMP = float(cfg.int_clamp)
         self.UPRIGHT_ANGLE_THRESH = float(cfg.upright_angle_thresh)
         self.UPRIGHT_VEL_THRESH = float(cfg.upright_vel_thresh)
@@ -406,12 +431,12 @@ class ControllerEvaluator:
         if do_forward:
             mujoco.mj_forward(self.model, self.data)
 
-    def _linearize(self):
+    def _linearize(self, pitch_rad: float | None = None, roll_rad: float | None = None):
         self.data.qpos[:] = self.model.qpos0
         self.data.qvel[:] = 0.0
         self.data.ctrl[:] = 0.0
-        self.data.qpos[self.q_pitch] = self.PITCH_EQ
-        self.data.qpos[self.q_roll] = self.ROLL_EQ
+        self.data.qpos[self.q_pitch] = self.PITCH_EQ if pitch_rad is None else float(pitch_rad)
+        self.data.qpos[self.q_roll] = self.ROLL_EQ if roll_rad is None else float(roll_rad)
         if self.lock_root_attitude:
             self._enforce_planar_root_attitude(do_forward=False)
         mujoco.mj_forward(self.model, self.data)
@@ -437,6 +462,15 @@ class ControllerEvaluator:
         A = A_full[np.ix_(idx, idx)]
         B = B_full[np.ix_(idx, [self.aid_rw, self.aid_base_x, self.aid_base_y])]
         return A, B
+
+    def _resolve_linearization(self, pitch_rad: float, roll_rad: float) -> tuple[np.ndarray, np.ndarray]:
+        key = (round(float(pitch_rad), 8), round(float(roll_rad), 8))
+        cached = self._linearization_cache.get(key)
+        if cached is not None:
+            return cached
+        a_lin, b_lin = self._linearize(pitch_rad=float(pitch_rad), roll_rad=float(roll_rad))
+        self._linearization_cache[key] = (a_lin, b_lin)
+        return a_lin, b_lin
 
     def _build_measurement_matrix(self, cfg: runtime_cfg.RuntimeConfig) -> np.ndarray:
         rows = [
@@ -475,16 +509,22 @@ class ControllerEvaluator:
             )
         return np.diag(variances)
 
-    def _build_kalman_gain(self, cfg: runtime_cfg.RuntimeConfig, wheel_lsb_rad_s: float, C_meas: np.ndarray):
+    def _build_kalman_gain(
+        self,
+        cfg: runtime_cfg.RuntimeConfig,
+        wheel_lsb_rad_s: float,
+        C_meas: np.ndarray,
+        A_lin: np.ndarray,
+    ):
         R_meas = self._build_measurement_noise_cov(cfg, wheel_lsb_rad_s)
-        Pk = self._solve_discrete_are_robust(self.A.T, C_meas.T, self.QN, R_meas, label="Kalman")
+        Pk = self._solve_discrete_are_robust(A_lin.T, C_meas.T, self.QN, R_meas, label="Kalman")
         gram = C_meas @ Pk @ C_meas.T + R_meas
         rhs = C_meas @ Pk.T
         return self._solve_linear_robust(gram, rhs, label="Kalman gain").T
 
-    def _build_lqr_gain(self, params: CandidateParams):
-        A_aug = np.block([[self.A, self.B], [np.zeros((3, 9)), np.eye(3)]])
-        B_aug = np.vstack([self.B, np.eye(3)])
+    def _build_lqr_gain(self, params: CandidateParams, A_lin: np.ndarray, B_lin: np.ndarray):
+        A_aug = np.block([[A_lin, B_lin], [np.zeros((3, 9)), np.eye(3)]])
+        B_aug = np.vstack([B_lin, np.eye(3)])
 
         qx = self.QX.copy()
         qx[0, 0] *= params.q_ang_scale
@@ -578,16 +618,18 @@ class ControllerEvaluator:
         config: EpisodeConfig,
         collect_disturbance_events: bool = False,
         collect_pitch_phase_trace: bool = False,
+        collect_rw_du_clip_sign_stats: bool = False,
+        collect_filter_error_stats: bool = False,
     ) -> Dict[str, float]:
         rng = np.random.default_rng(episode_seed)
+        runtime_cfg_for_episode = self._resolve_runtime_cfg(config)
+        self._sync_runtime_tuning(runtime_cfg_for_episode)
+        A_base, B_base = self._resolve_linearization(self.LINEARIZE_PITCH_RAD, self.LINEARIZE_ROLL_RAD)
         self._reset_with_initial_state(rng, config)
         a_scale, b_scale, disturbance_scale = self._variant_scales(config.model_variant_id)
         noise_scale, timing_jitter_frac = self._domain_noise_scales(config.domain_profile_id)
-        A_run = self.A * a_scale
-        B_run = self.B * b_scale
-        B_run_pinv = np.linalg.pinv(B_run)
-        runtime_cfg_for_episode = self._resolve_runtime_cfg(config)
-        self._sync_runtime_tuning(runtime_cfg_for_episode)
+        A_run_step = A_base * a_scale
+        B_run_step = B_base * b_scale
 
         if not runtime_cfg_for_episode.hardware_realistic:
             control_steps = 1
@@ -595,10 +637,12 @@ class ControllerEvaluator:
             denom_hz = max(float(runtime_cfg_for_episode.control_hz), 1e-9)
             control_steps = max(1, int(round(1.0 / (self.dt * denom_hz))))
         control_dt = control_steps * self.dt
+        A_run, B_run = self._lift_discrete_dynamics(A_run_step, B_run_step, control_steps)
+        B_run_pinv = np.linalg.pinv(B_run)
         wheel_ticks = max(int(runtime_cfg_for_episode.wheel_encoder_ticks_per_rev), 1)
         wheel_lsb = (2.0 * np.pi) / (wheel_ticks * control_dt)
         C_meas = self._build_measurement_matrix(runtime_cfg_for_episode)
-        L = self._build_kalman_gain(runtime_cfg_for_episode, wheel_lsb, C_meas)
+        L = self._build_kalman_gain(runtime_cfg_for_episode, wheel_lsb, C_meas, A_lin=A_run)
 
         queue_len = (
             1 if not runtime_cfg_for_episode.hardware_realistic else max(int(runtime_cfg_for_episode.control_delay_steps), 0) + 1
@@ -651,6 +695,13 @@ class ControllerEvaluator:
         disturbance_events: List[Dict[str, float]] = []
         pitch_phase_trace: List[Dict[str, float | str]] = []
         phase_switch_events: List[Dict[str, float | str]] = []
+        rw_du_clip_pos = 0
+        rw_du_clip_neg = 0
+        rw_du_clip_zero = 0
+        rw_du_total_samples = 0
+        filter_err_pitch_samples: List[float] = []
+        filter_err_pitch_ctrl_samples: List[float] = []
+        true_pitch_samples: List[float] = []
 
         family = str(getattr(config, "controller_family", "current"))
         low_spin_robust = (config.stability_profile == "low-spin-robust") and family in ("current", "current_dob", "hybrid_modern")
@@ -661,7 +712,7 @@ class ControllerEvaluator:
         mpc_family = family == "baseline_mpc"
         robust_hinf_family = family == "baseline_robust_hinf_like"
 
-        k_du = self._build_lqr_gain(params)
+        k_du = self._build_lqr_gain(params, A_lin=A_run, B_lin=B_run)
         a_w = A_run[np.ix_([0, 2, 4], [0, 2, 4])]
         b_w = B_run[np.ix_([0, 2, 4], [0])]
         q_w = np.diag([260.0, 35.0, 0.6])
@@ -731,7 +782,7 @@ class ControllerEvaluator:
             )
 
             # Continuous predictor at simulation rate.
-            x_pred = A_run @ x_est + B_run @ u_eff_applied
+            x_pred = A_run_step @ x_est + B_run_step @ u_eff_applied
             x_est = x_pred
 
             effective_control_steps = control_steps
@@ -789,7 +840,7 @@ class ControllerEvaluator:
                             }
                         )
                 if balance_phase == "recovery":
-                    recovery_time_s += control_dt
+                        recovery_time_s += control_dt
 
                 if runtime_cfg_for_episode.dob_enabled:
                     if dob_prev_x_est is None:
@@ -891,6 +942,15 @@ class ControllerEvaluator:
                 if self.RW_EMERGENCY_DU_ENABLED and balance_phase != "hold":
                     if abs(float(x_est[0])) >= self.RW_EMERGENCY_PITCH_RAD:
                         rw_du_limit *= self.RW_EMERGENCY_DU_SCALE
+                if collect_rw_du_clip_sign_stats:
+                    rw_du_total_samples += 1
+                    if abs(du_rw_cmd) > rw_du_limit:
+                        if du_rw_cmd > 0.0:
+                            rw_du_clip_pos += 1
+                        elif du_rw_cmd < 0.0:
+                            rw_du_clip_neg += 1
+                        else:
+                            rw_du_clip_zero += 1
                 du_rw = float(np.clip(du_rw_cmd, -rw_du_limit, rw_du_limit))
                 u_rw_unc = float(u_eff_applied[0] + du_rw)
                 u_rw_cmd = float(np.clip(u_rw_unc, -self.MAX_U[0], self.MAX_U[0]))
@@ -1130,6 +1190,11 @@ class ControllerEvaluator:
                 else:
                     u_applied = u_cmd
                 dob_prev_x_est = x_est.copy()
+            if collect_filter_error_stats:
+                filter_err_pitch_samples.append(float(x_est[0] - x_true[0]))
+                true_pitch_samples.append(float(x_true[0]))
+                if step % effective_control_steps == 0:
+                    filter_err_pitch_ctrl_samples.append(float(x_est[0] - x_true[0]))
             if low_spin_robust and balance_phase == "hold":
                 hold_steps += 1
             if low_spin_robust and high_spin_active:
@@ -1361,6 +1426,45 @@ class ControllerEvaluator:
         if collect_pitch_phase_trace:
             result["pitch_phase_trace"] = pitch_phase_trace
             result["phase_switch_events"] = phase_switch_events
+        if collect_rw_du_clip_sign_stats:
+            total_clips = rw_du_clip_pos + rw_du_clip_neg + rw_du_clip_zero
+            result["rw_du_clip_pos"] = float(rw_du_clip_pos)
+            result["rw_du_clip_neg"] = float(rw_du_clip_neg)
+            result["rw_du_clip_zero"] = float(rw_du_clip_zero)
+            result["rw_du_clip_total"] = float(total_clips)
+            result["rw_du_clip_rate"] = float(total_clips / max(rw_du_total_samples, 1))
+            result["rw_du_clip_pos_frac"] = float(rw_du_clip_pos / max(total_clips, 1))
+            result["rw_du_clip_neg_frac"] = float(rw_du_clip_neg / max(total_clips, 1))
+        if collect_filter_error_stats:
+            arr = np.asarray(filter_err_pitch_samples, dtype=float)
+            carr = np.asarray(filter_err_pitch_ctrl_samples, dtype=float)
+            tarr = np.asarray(true_pitch_samples, dtype=float)
+            if arr.size > 0:
+                result["filter_err_pitch_mean_rad"] = float(np.mean(arr))
+                result["filter_err_pitch_mean_deg"] = float(np.degrees(np.mean(arr)))
+                result["filter_err_pitch_std_deg"] = float(np.degrees(np.std(arr)))
+                result["filter_err_pitch_median_deg"] = float(np.degrees(np.median(arr)))
+                result["filter_err_pitch_p05_deg"] = float(np.degrees(np.percentile(arr, 5)))
+                result["filter_err_pitch_p95_deg"] = float(np.degrees(np.percentile(arr, 95)))
+                result["filter_err_pitch_neg_frac"] = float(np.mean(arr < 0.0))
+                result["filter_err_pitch_pos_frac"] = float(np.mean(arr > 0.0))
+                result["filter_err_pitch_samples"] = float(arr.size)
+                if tarr.size == arr.size and tarr.size > 2:
+                    slope = float(np.polyfit(tarr, arr, 1)[0])
+                    result["filter_err_vs_true_pitch_slope_deg_per_deg"] = float(slope)
+                    # High-angle bucket: top quartile of true pitch magnitude.
+                    q = float(np.quantile(np.abs(tarr), 0.75))
+                    hi_mask = np.abs(tarr) >= q
+                    if np.any(hi_mask):
+                        result["filter_err_high_angle_mean_deg"] = float(np.degrees(np.mean(arr[hi_mask])))
+                    lo_mask = np.abs(tarr) < q
+                    if np.any(lo_mask):
+                        result["filter_err_low_angle_mean_deg"] = float(np.degrees(np.mean(arr[lo_mask])))
+            if carr.size > 0:
+                result["filter_err_pitch_ctrl_mean_deg"] = float(np.degrees(np.mean(carr)))
+                result["filter_err_pitch_ctrl_neg_frac"] = float(np.mean(carr < 0.0))
+                result["filter_err_pitch_ctrl_pos_frac"] = float(np.mean(carr > 0.0))
+                result["filter_err_pitch_ctrl_samples"] = float(carr.size)
         return result
 
     def evaluate_candidate(

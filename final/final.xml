@@ -1,5 +1,5 @@
 <mujoco model="wheel_on_stick">
-    <!-- Big picture: unconstrained free-body base + ball-drive gimbal + reaction wheel, on uneven terrain. -->
+    <!-- Big picture: world-rooted base (via weld) + ball-drive gimbal + reaction wheel, on uneven terrain. -->
     <!-- Reader Mode:
          - Dynamics (mass/collision critical): base cylinder, stick capsule, wheel rotor + hub, terrain, free-joint + gimbal/hinge joints.
          - Visual-only (mass=0 and contype/conaffinity=0): chassis shell/plate, bumpers, dome, torso/head/eyes, rim/tire/spokes.
@@ -455,6 +455,11 @@
         <exclude body1="base_y" body2="stick"/>
     </contact>
 
+    <equality>
+        <!-- Keep base rooted to world so pitch/roll gravity couples into joint dynamics. -->
+        <weld name="lock_base_to_world" body1="base_x"/>
+    </equality>
+
     <actuator>
         <!-- Motor command for wheel spin torque. -->
         <motor name="wheel_spin"
@@ -468,7 +473,7 @@
 
         <!-- Motor command for base Y force. -->
         <motor name="base_y_force"
-               joint="stick_roll"
+               joint="base_y_slide"
                ctrlrange="-100 100"/>
 
     </actuator>

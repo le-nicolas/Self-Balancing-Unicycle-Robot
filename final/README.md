@@ -23,6 +23,7 @@ The goal of this README is to explain:
 | `final/controller_eval.py` | Headless evaluator used by benchmarking/tuning scripts. |
 | `final/benchmark.py` | Reproducible stress benchmark and artifact writer. |
 | `final/analyze_crash_coupling.py` | Replays one episode and prints pre-crash disturbance-event wheel/pitch trends for coupling diagnosis. |
+| `final/find_lqr_envelope.py` | Binary-searches disturbance XY magnitude where per-cycle pitch ratchet crosses a target threshold. |
 | `final/sim2real_sensitivity.py` | Ranks model/domain sensitivity from benchmark CSV baselines. |
 | `final/build_residual_dataset.py` | Builds supervised residual dataset from paired baseline/teacher traces. |
 | `final/train_residual_model.py` | Trains residual MLP checkpoint compatible with runtime loader. |
@@ -351,6 +352,20 @@ Output includes:
 1. Disturbance-event rows (`step,wheel_speed,pitch,pitch_rate,force_xyz`).
 2. Linear trend slopes for wheel speed and pitch.
 3. `coupling_confirmed=1` when wheel speed trends negative while pitch trends positive across selected events.
+
+### 5.10 LQR Envelope Boundary Search
+
+Use binary search to estimate the largest disturbance XY magnitude where per-cycle pitch ratchet meets a target:
+
+```powershell
+python final/find_lqr_envelope.py --episode-indices 20 --disturbance-interval 200 --xy-min 0 --xy-max 12 --target-ratchet-deg-per-cycle 0.0
+```
+
+Key outputs:
+
+1. `ratchet_mean` (deg/cycle): mean increase in `|pitch|` between disturbance events.
+2. `slope100_mean` (deg/s): mean 100-step end-of-window slope of `|pitch|`.
+3. `boundary_xy_approx`: estimated disturbance magnitude boundary for the selected target.
 
 ## 6) Rebuild From Scratch (Recommended Path)
 
