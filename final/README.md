@@ -22,6 +22,7 @@ The goal of this README is to explain:
 | `final/mpc_controller.py` | Constrained MPC solver (OSQP/scipy fallback). |
 | `final/controller_eval.py` | Headless evaluator used by benchmarking/tuning scripts. |
 | `final/benchmark.py` | Reproducible stress benchmark and artifact writer. |
+| `final/analyze_crash_coupling.py` | Replays one episode and prints pre-crash disturbance-event wheel/pitch trends for coupling diagnosis. |
 | `final/sim2real_sensitivity.py` | Ranks model/domain sensitivity from benchmark CSV baselines. |
 | `final/build_residual_dataset.py` | Builds supervised residual dataset from paired baseline/teacher traces. |
 | `final/train_residual_model.py` | Trains residual MLP checkpoint compatible with runtime loader. |
@@ -168,6 +169,7 @@ General behavior impact you should expect:
 | Occasional self-collision artifacts | Base and stick could collide at nominal assembly | Added contact exclusion between `base_y` and `stick` | `final/final.xml` |
 | MPC solve failures caused unstable behavior | Optimizer can fail/infeasible on some steps | Added runtime fallback to clipped one-step linear feedback | `final/control_core.py` |
 | MPC was stable but could drift into persistent backward pitch mode | Slow model mismatch and insufficient late-stage recovery | Added terminal/reference shaping, pitch I-term, pitch rescue guard, and base-x pitch support blending | `final/runtime_config.py`, `final/mpc_controller.py`, `final/control_core.py`, `final/final.py` |
+| Repeated disturbances could ratchet wheel speed bias and reduce recovery authority | Wheel momentum remained pre-biased between disturbance events | Added hold-phase wheel momentum bias integrator that uses small base-x bias to bleed wheel speed toward zero | `final/control_core.py`, `final/controller_eval.py` |
 | Crash logs were hard to interpret | Failures were grouped as generic tilt | Added explicit `pitch_tilt` vs `roll_tilt` vs `com_overload` reason logging | `final/final.py` |
 
 ## 4.1) Troubleshooting Matrix
@@ -331,6 +333,24 @@ Example:
 ```powershell
 python final/final.py --mode robust --enable-online-id --online-id-recompute-every 25 --online-id-min-updates 60
 ```
+
+### 5.9 Crash-Coupling Disturbance Analysis
+
+Use this to replay one episode and inspect the six disturbance events before crash (or end-of-episode if no crash):
+
+```powershell
+# 1-based episode index (default indexing in throughput_ablation JSON)
+python final/analyze_crash_coupling.py --episode-index 20 --window-start 4600 --window-end 5600 --events 6
+
+# 0-based index if your notes label "episode 20" as the 21st seed
+python final/analyze_crash_coupling.py --episode-index 20 --zero-based-index --window-start 4600 --window-end 5600 --events 6
+```
+
+Output includes:
+
+1. Disturbance-event rows (`step,wheel_speed,pitch,pitch_rate,force_xyz`).
+2. Linear trend slopes for wheel speed and pitch.
+3. `coupling_confirmed=1` when wheel speed trends negative while pitch trends positive across selected events.
 
 ## 6) Rebuild From Scratch (Recommended Path)
 

@@ -251,6 +251,7 @@ class FullFinalRuntime:
             u_eff_applied,
             base_int,
             wheel_pitch_int,
+            wheel_momentum_bias_int,
             base_ref,
             base_authority_state,
             u_base_smooth,
@@ -295,6 +296,7 @@ class FullFinalRuntime:
         self.u_eff_applied = u_eff_applied
         self.base_int = base_int
         self.wheel_pitch_int = wheel_pitch_int
+        self.wheel_momentum_bias_int = wheel_momentum_bias_int
         self.base_ref = base_ref
         self.base_authority_state = base_authority_state
         self.u_base_smooth = u_base_smooth
@@ -367,6 +369,7 @@ class FullFinalRuntime:
             self.u_eff_applied,
             self.base_int,
             self.wheel_pitch_int,
+            self.wheel_momentum_bias_int,
             self.base_ref,
             self.base_authority_state,
             self.u_base_smooth,
@@ -444,6 +447,7 @@ class FullFinalRuntime:
                 self.base_authority_state,
                 self.u_base_smooth,
                 self.wheel_pitch_int,
+                self.wheel_momentum_bias_int,
                 rw_u_limit,
                 wheel_over_budget,
                 wheel_over_hard,
@@ -459,6 +463,7 @@ class FullFinalRuntime:
                 base_authority_state=self.base_authority_state,
                 u_base_smooth=self.u_base_smooth,
                 wheel_pitch_int=self.wheel_pitch_int,
+                wheel_momentum_bias_int=self.wheel_momentum_bias_int,
                 balance_phase=self.balance_phase,
                 recovery_time_s=self.recovery_time_s,
                 high_spin_active=self.high_spin_active,

@@ -18,6 +18,7 @@ def reset_controller_buffers(nx: int, nu: int, queue_len: int):
     u_eff_applied = np.zeros(nu)
     base_int = np.zeros(2)
     wheel_pitch_int = 0.0
+    wheel_momentum_bias_int = 0.0
     base_ref = np.zeros(2)
     base_authority_state = 0.0
     u_base_smooth = np.zeros(2)
@@ -31,6 +32,7 @@ def reset_controller_buffers(nx: int, nu: int, queue_len: int):
         u_eff_applied,
         base_int,
         wheel_pitch_int,
+        wheel_momentum_bias_int,
         base_ref,
         base_authority_state,
         u_base_smooth,
@@ -142,6 +144,28 @@ def _init_control_terms() -> dict[str, np.ndarray]:
     }
 
 
+def _update_wheel_momentum_bias(
+    cfg: RuntimeConfig,
+    wheel_momentum_bias_int: float,
+    wheel_speed_est: float,
+    balance_phase: str,
+    control_dt: float,
+) -> tuple[float, float]:
+    # Slow hold-phase wheel recentering: integrate wheel-speed bias, leak elsewhere.
+    speed_ref = min(cfg.wheel_spin_budget_frac * cfg.max_wheel_speed_rad_s, cfg.wheel_spin_budget_abs_rad_s)
+    speed_ref = max(0.35 * speed_ref, 1e-3)
+    if balance_phase == "hold":
+        wheel_norm = float(np.clip(wheel_speed_est / speed_ref, -2.0, 2.0))
+        wheel_momentum_bias_int += wheel_norm * control_dt
+        wheel_momentum_bias_int = float(np.clip(wheel_momentum_bias_int, -2.0, 2.0))
+    else:
+        leak = float(np.clip(0.65 * control_dt, 0.0, 1.0))
+        wheel_momentum_bias_int = float((1.0 - leak) * wheel_momentum_bias_int)
+
+    bias_cmd = float(np.clip(-0.32 * cfg.wheel_to_base_bias_gain * wheel_momentum_bias_int, -0.25, 0.25))
+    return wheel_momentum_bias_int, bias_cmd
+
+
 def _fuzzy_roll_gain(cfg: RuntimeConfig, roll: float, roll_rate: float) -> float:
     roll_n = abs(roll) / max(cfg.hold_exit_angle_rad, 1e-6)
     rate_n = abs(roll_rate) / max(cfg.hold_exit_rate_rad_s, 1e-6)
@@ -247,6 +271,7 @@ def compute_control_command(
     base_authority_state: float,
     u_base_smooth: np.ndarray,
     wheel_pitch_int: float,
+    wheel_momentum_bias_int: float,
     balance_phase: str,
     recovery_time_s: float,
     high_spin_active: bool,
@@ -467,6 +492,7 @@ def compute_control_command(
             base_authority_state,
             u_base_smooth,
             wheel_pitch_int,
+            wheel_momentum_bias_int,
             rw_u_limit,
             wheel_over_budget,
             wheel_over_hard,
@@ -549,6 +575,7 @@ def compute_control_command(
             base_authority_state,
             u_base_smooth,
             wheel_pitch_int,
+            wheel_momentum_bias_int,
             rw_u_limit,
             wheel_over_budget,
             wheel_over_hard,
@@ -574,6 +601,7 @@ def compute_control_command(
         rw_u_limit = cfg.wheel_only_max_u
         base_int[:] = 0.0
         base_ref[:] = 0.0
+        wheel_momentum_bias_int = 0.0
     else:
         wheel_pitch_int = 0.0
         rw_frac = abs(float(x_est[4])) / max(cfg.max_wheel_speed_rad_s, 1e-6)
@@ -752,6 +780,15 @@ def compute_control_command(
             bias_term = -np.sign(x_est[4]) * cfg.wheel_to_base_bias_gain * extra_bias * over_budget
             terms["term_despin"][1] += bias_term
             base_target_x += bias_term
+        wheel_momentum_bias_int, hold_bias_term = _update_wheel_momentum_bias(
+            cfg=cfg,
+            wheel_momentum_bias_int=wheel_momentum_bias_int,
+            wheel_speed_est=float(x_est[4]),
+            balance_phase=balance_phase,
+            control_dt=control_dt,
+        )
+        base_target_x += hold_bias_term
+        terms["term_despin"][1] += hold_bias_term
 
         du_base_cmd = np.array([base_target_x, base_target_y]) - u_eff_applied[1:]
         base_du_limit = cfg.max_du[1:].copy()
@@ -774,6 +811,7 @@ def compute_control_command(
     else:
         base_int[:] = 0.0
         base_ref[:] = 0.0
+        wheel_momentum_bias_int = 0.0
         du_base_cmd = -u_eff_applied[1:]
         du_hits[1:] += (np.abs(du_base_cmd) > cfg.max_du[1:]).astype(int)
         du_base = np.clip(du_base_cmd, -cfg.max_du[1:], cfg.max_du[1:])
@@ -793,6 +831,7 @@ def compute_control_command(
         base_authority_state,
         u_base_smooth,
         wheel_pitch_int,
+        wheel_momentum_bias_int,
         rw_u_limit,
         wheel_over_budget,
         wheel_over_hard,

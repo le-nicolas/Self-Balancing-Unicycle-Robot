@@ -612,6 +612,7 @@ class ControllerEvaluator:
         base_ref = np.zeros(2, dtype=float)
         base_authority_state = 0.0
         u_base_smooth = np.zeros(2, dtype=float)
+        wheel_momentum_bias_int = 0.0
         balance_phase = "recovery"
         recovery_time_s = 0.0
         high_spin_active = False
@@ -653,6 +654,7 @@ class ControllerEvaluator:
 
         family = str(getattr(config, "controller_family", "current"))
         low_spin_robust = (config.stability_profile == "low-spin-robust") and family in ("current", "current_dob", "hybrid_modern")
+        use_hold_momentum_bias = family in ("current", "current_dob", "hybrid_modern")
         legacy_family = family in ("legacy_wheel_pid", "legacy_wheel_lqr", "legacy_run_pd")
         paper_family = family == "paper_split_baseline"
         hybrid_family = family == "hybrid_modern"
@@ -1035,6 +1037,23 @@ class ControllerEvaluator:
                         )
                         extra_bias = 1.25 if high_spin_active else 1.0
                         base_target_x += -np.sign(x_est[4]) * self.WHEEL_TO_BASE_BIAS_GAIN * extra_bias * over_budget
+                if use_hold_momentum_bias and (not mpc_family):
+                    speed_ref = min(
+                        self.WHEEL_SPIN_BUDGET_FRAC * self.MAX_WHEEL_SPEED_RAD_S,
+                        self.WHEEL_SPIN_BUDGET_ABS_RAD_S,
+                    )
+                    speed_ref = max(0.35 * speed_ref, 1e-3)
+                    if balance_phase == "hold":
+                        wheel_norm = float(np.clip(float(x_est[4]) / speed_ref, -2.0, 2.0))
+                        wheel_momentum_bias_int += wheel_norm * control_dt
+                        wheel_momentum_bias_int = float(np.clip(wheel_momentum_bias_int, -2.0, 2.0))
+                    else:
+                        leak = float(np.clip(0.65 * control_dt, 0.0, 1.0))
+                        wheel_momentum_bias_int = float((1.0 - leak) * wheel_momentum_bias_int)
+                    hold_bias_term = float(
+                        np.clip(-0.32 * self.WHEEL_TO_BASE_BIAS_GAIN * wheel_momentum_bias_int, -0.25, 0.25)
+                    )
+                    base_target_x += hold_bias_term
 
                 du_base_cmd = np.array([base_target_x, base_target_y]) - u_eff_applied[1:]
                 base_du_limit = max_du[1:].copy()
