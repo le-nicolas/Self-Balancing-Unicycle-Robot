@@ -31,7 +31,7 @@ PROTOCOL_SCHEMA_VERSION = "protocol_v1"
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Fast robustness benchmark + random-search tuner.")
-    parser.add_argument("--seed", type=int, default=12345)
+    parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
         "--benchmark-profile",
         choices=["fast_pr", "nightly_long"],

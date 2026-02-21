@@ -71,6 +71,9 @@ class RuntimeConfig:
     gain_schedule_weights: np.ndarray
     max_u: np.ndarray
     max_du: np.ndarray
+    rw_emergency_du_enabled: bool
+    rw_emergency_pitch_rad: float
+    rw_emergency_du_scale: float
     disturbance_magnitude: float
     disturbance_interval: int
     qx: np.ndarray
@@ -80,6 +83,8 @@ class RuntimeConfig:
     base_integrator_enabled: bool
     u_bleed: float
     crash_angle_rad: float
+    crash_divergence_gate_enabled: bool
+    crash_recovery_window_steps: int
     payload_mass_kg: float
     payload_support_radius_m: float
     payload_com_fail_steps: int
@@ -124,6 +129,7 @@ class RuntimeConfig:
     base_force_soft_limit: float
     base_damping_gain: float
     base_centering_gain: float
+    hold_base_x_centering_gain: float
     base_tilt_deadband_rad: float
     base_tilt_full_authority_rad: float
     base_command_gain: float
@@ -385,7 +391,7 @@ def parse_args(argv=None):
         action="store_true",
         help="Enable base x/y integral action. Disabled by default to avoid drift with unobserved base states.",
     )
-    parser.add_argument("--seed", type=int, default=12345)
+    parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
         "--initial-y-tilt-deg",
         type=float,
@@ -393,6 +399,45 @@ def parse_args(argv=None):
         help="Initial stick tilt in degrees in Y direction (implemented as roll for base_y response).",
     )
     parser.add_argument("--crash-angle-deg", type=float, default=25.0)
+    parser.add_argument(
+        "--crash-gate-divergence",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Require same-sign pitch_rate when |pitch| exceeds crash angle. "
+            "If converging (opposite sign), apply recovery window before crash."
+        ),
+    )
+    parser.add_argument(
+        "--crash-recovery-steps",
+        type=int,
+        default=500,
+        help="Recovery grace window (simulation steps) while over-angle but converging.",
+    )
+    parser.add_argument(
+        "--rw-emergency-du",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable high-angle emergency boost on reaction-wheel delta-u limit.",
+    )
+    parser.add_argument(
+        "--rw-emergency-pitch-deg",
+        type=float,
+        default=15.0,
+        help="Pitch angle threshold (deg) for emergency reaction-wheel delta-u boost.",
+    )
+    parser.add_argument(
+        "--rw-emergency-du-scale",
+        type=float,
+        default=1.5,
+        help="Multiplier on reaction-wheel delta-u limit while emergency boost is active.",
+    )
+    parser.add_argument(
+        "--hold-base-x-centering-gain",
+        type=float,
+        default=0.0,
+        help="Extra base-x centering spring gain (N/m) applied only during hold phase.",
+    )
     parser.add_argument(
         "--payload-mass",
         type=float,
@@ -1001,6 +1046,17 @@ def build_config(args) -> RuntimeConfig:
         wheel_only_max_u = min(wheel_only_max_u, 2.5)
         wheel_only_max_du = min(wheel_only_max_du, 0.15)
 
+    crash_divergence_gate_enabled = bool(getattr(args, "crash_gate_divergence", True))
+    crash_recovery_window_steps = max(int(getattr(args, "crash_recovery_steps", 500)), 0)
+    rw_emergency_du_enabled = bool(getattr(args, "rw_emergency_du", True))
+    rw_emergency_pitch_rad = float(np.radians(max(float(getattr(args, "rw_emergency_pitch_deg", 15.0)), 0.0)))
+    rw_emergency_du_scale = float(max(float(getattr(args, "rw_emergency_du_scale", 1.5)), 1.0))
+    if hardware_safe or real_hardware_profile:
+        # Keep real-hardware bring-up conservative unless explicitly retuned.
+        rw_emergency_du_enabled = False
+        rw_emergency_du_scale = 1.0
+    hold_base_x_centering_gain = float(max(getattr(args, "hold_base_x_centering_gain", 0.0), 0.0))
+
     # Runtime mode resolution: preserve CLI intent with staged real-hardware safety.
     allow_base_motion_requested = bool(args.allow_base_motion)
     wheel_only_requested = bool(args.wheel_only)
@@ -1150,6 +1206,9 @@ def build_config(args) -> RuntimeConfig:
         gain_schedule_weights=gain_schedule_weights,
         max_u=max_u,
         max_du=max_du,
+        rw_emergency_du_enabled=rw_emergency_du_enabled,
+        rw_emergency_pitch_rad=rw_emergency_pitch_rad,
+        rw_emergency_du_scale=rw_emergency_du_scale,
         disturbance_magnitude=disturbance_magnitude,
         disturbance_interval=disturbance_interval,
         qx=qx,
@@ -1159,6 +1218,8 @@ def build_config(args) -> RuntimeConfig:
         base_integrator_enabled=bool(args.enable_base_integrator),
         u_bleed=u_bleed,
         crash_angle_rad=np.radians(crash_angle_deg),
+        crash_divergence_gate_enabled=crash_divergence_gate_enabled,
+        crash_recovery_window_steps=crash_recovery_window_steps,
         payload_mass_kg=payload_mass_kg,
         payload_support_radius_m=payload_support_radius_m,
         payload_com_fail_steps=payload_com_fail_steps,
@@ -1203,6 +1264,7 @@ def build_config(args) -> RuntimeConfig:
         base_force_soft_limit=base_force_soft_limit,
         base_damping_gain=base_damping_gain,
         base_centering_gain=base_centering_gain,
+        hold_base_x_centering_gain=hold_base_x_centering_gain,
         base_tilt_deadband_rad=float(np.radians(base_tilt_deadband_deg)),
         base_tilt_full_authority_rad=float(np.radians(base_tilt_full_authority_deg)),
         base_command_gain=base_command_gain,

@@ -149,6 +149,19 @@ def _fuzzy_roll_gain(cfg: RuntimeConfig, roll: float, roll_rate: float) -> float
     return 0.35 + 0.95 * level
 
 
+def _resolve_rw_du_limit(
+    cfg: RuntimeConfig,
+    x_est: np.ndarray,
+    balance_phase: str,
+    wheel_only: bool,
+) -> float:
+    rw_du_limit = float(cfg.wheel_only_max_du if wheel_only else cfg.max_du[0])
+    if cfg.rw_emergency_du_enabled and balance_phase != "hold":
+        if abs(float(x_est[0])) >= cfg.rw_emergency_pitch_rad:
+            rw_du_limit *= cfg.rw_emergency_du_scale
+    return rw_du_limit
+
+
 def update_disturbance_observer(
     cfg: RuntimeConfig,
     A: np.ndarray,
@@ -485,7 +498,7 @@ def compute_control_command(
         terms["term_roll_stability"][0] = u_roll_sm
         u_rw_target = u_pitch + u_roll_sm
         du_rw_cmd = float(u_rw_target - u_eff_applied[0])
-        rw_du_limit = cfg.max_du[0]
+        rw_du_limit = _resolve_rw_du_limit(cfg=cfg, x_est=x_est, balance_phase=balance_phase, wheel_only=False)
         rw_u_limit = cfg.max_u[0]
         du_hits[0] += int(abs(du_rw_cmd) > rw_du_limit)
         du_rw = float(np.clip(du_rw_cmd, -rw_du_limit, rw_du_limit))
@@ -552,7 +565,7 @@ def compute_control_command(
         u_rw_target += -cfg.wheel_only_pitch_ki * wheel_pitch_int
         u_rw_target += -cfg.wheel_only_wheel_rate_kd * x_est[4]
         du_rw_cmd = float(u_rw_target - u_eff_applied[0])
-        rw_du_limit = cfg.wheel_only_max_du
+        rw_du_limit = _resolve_rw_du_limit(cfg=cfg, x_est=x_est, balance_phase=balance_phase, wheel_only=True)
         rw_u_limit = cfg.wheel_only_max_u
         base_int[:] = 0.0
         base_ref[:] = 0.0
@@ -570,7 +583,7 @@ def compute_control_command(
             du_rw_cmd += pitch_stab + roll_stab
             terms["term_pitch_stability"][0] += pitch_stab
             terms["term_roll_stability"][0] += roll_stab
-        rw_du_limit = cfg.max_du[0]
+        rw_du_limit = _resolve_rw_du_limit(cfg=cfg, x_est=x_est, balance_phase=balance_phase, wheel_only=False)
         rw_u_limit = cfg.max_u[0]
 
     du_hits[0] += int(abs(du_rw_cmd) > rw_du_limit)
@@ -714,6 +727,12 @@ def compute_control_command(
             terms["term_pitch_stability"][2] += cross_roll
         base_target_x = (1.0 - base_authority) * hold_x + base_authority * balance_x
         base_target_y = (1.0 - base_authority) * hold_y + base_authority * balance_y
+        hold_center_x = 0.0
+        if balance_phase == "hold" and cfg.hold_base_x_centering_gain > 0.0:
+            hold_center_err_x = float(np.clip(x_est[5], -cfg.base_centering_pos_clip_m, cfg.base_centering_pos_clip_m))
+            hold_center_x = float(-cfg.hold_base_x_centering_gain * hold_center_err_x)
+            base_target_x += hold_center_x
+            terms["term_base_hold"][1] += hold_center_x
         if cfg.base_integrator_enabled and cfg.ki_base > 0.0:
             base_target_x += -cfg.ki_base * base_int[0]
             base_target_y += -cfg.ki_base * base_int[1]

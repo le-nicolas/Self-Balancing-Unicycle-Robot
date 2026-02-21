@@ -38,10 +38,20 @@ class EpisodeConfig:
     disturbance_interval: int = 300
     init_angle_deg: float = 4.0
     init_base_pos_m: float = 0.15
+    init_pitch_deg_override: float | None = None
+    init_roll_deg_override: float | None = None
+    init_base_x_m_override: float | None = None
+    init_base_y_m_override: float | None = None
     max_worst_tilt_deg: float = 20.0
     max_worst_base_m: float = 4.0
     max_mean_sat_rate_du: float = 0.98
     max_mean_sat_rate_abs: float = 0.90
+    crash_divergence_gate: bool = True
+    crash_recovery_steps: int = 500
+    rw_emergency_du: bool = True
+    rw_emergency_pitch_deg: float = 15.0
+    rw_emergency_du_scale: float = 1.5
+    hold_base_x_centering_gain: float = 0.0
     mode: str = "smooth"
     control_hz: float = 250.0
     control_delay_steps: int = 1
@@ -224,6 +234,12 @@ class ControllerEvaluator:
             round(float(config.imu_rate_noise_std_rad_s), 12),
             round(float(config.wheel_encoder_rate_noise_std_rad_s), 12),
             str(config.controller_family),
+            bool(config.crash_divergence_gate),
+            int(config.crash_recovery_steps),
+            bool(config.rw_emergency_du),
+            round(float(config.rw_emergency_pitch_deg), 8),
+            round(float(config.rw_emergency_du_scale), 8),
+            round(float(config.hold_base_x_centering_gain), 8),
         )
         cached = self._runtime_cfg_cache.get(key)
         if cached is not None:
@@ -248,6 +264,14 @@ class ControllerEvaluator:
             f"{float(config.imu_rate_noise_std_rad_s)}",
             "--wheel-rate-noise",
             f"{float(config.wheel_encoder_rate_noise_std_rad_s)}",
+            "--crash-recovery-steps",
+            str(int(config.crash_recovery_steps)),
+            "--rw-emergency-pitch-deg",
+            f"{float(config.rw_emergency_pitch_deg)}",
+            "--rw-emergency-du-scale",
+            f"{float(config.rw_emergency_du_scale)}",
+            "--hold-base-x-centering-gain",
+            f"{float(config.hold_base_x_centering_gain)}",
             "--controller-family",
             (
                 str(config.controller_family)
@@ -255,6 +279,8 @@ class ControllerEvaluator:
                 else "current"
             ),
         ]
+        argv.append("--crash-gate-divergence" if bool(config.crash_divergence_gate) else "--no-crash-gate-divergence")
+        argv.append("--rw-emergency-du" if bool(config.rw_emergency_du) else "--no-rw-emergency-du")
         if not config.hardware_realistic:
             argv.append("--legacy-model")
 
@@ -271,7 +297,12 @@ class ControllerEvaluator:
         self.UPRIGHT_VEL_THRESH = float(cfg.upright_vel_thresh)
         self.UPRIGHT_POS_THRESH = float(cfg.upright_pos_thresh)
         self.CRASH_ANGLE_RAD = float(cfg.crash_angle_rad)
+        self.CRASH_DIVERGENCE_GATE_ENABLED = bool(cfg.crash_divergence_gate_enabled)
+        self.CRASH_RECOVERY_WINDOW_STEPS = int(max(cfg.crash_recovery_window_steps, 0))
         self.MAX_U = np.asarray(cfg.max_u, dtype=float).copy()
+        self.RW_EMERGENCY_DU_ENABLED = bool(cfg.rw_emergency_du_enabled)
+        self.RW_EMERGENCY_PITCH_RAD = float(max(cfg.rw_emergency_pitch_rad, 0.0))
+        self.RW_EMERGENCY_DU_SCALE = float(max(cfg.rw_emergency_du_scale, 1.0))
         self.MAX_WHEEL_SPEED_RAD_S = float(cfg.max_wheel_speed_rad_s)
         self.MAX_BASE_SPEED_M_S = float(cfg.max_base_speed_m_s)
         self.WHEEL_TORQUE_DERATE_START = float(cfg.wheel_torque_derate_start)
@@ -279,6 +310,7 @@ class ControllerEvaluator:
         self.BASE_FORCE_SOFT_LIMIT = float(cfg.base_force_soft_limit)
         self.BASE_DAMPING_GAIN = float(cfg.base_damping_gain)
         self.BASE_CENTERING_GAIN = float(cfg.base_centering_gain)
+        self.HOLD_BASE_X_CENTERING_GAIN = float(max(getattr(cfg, "hold_base_x_centering_gain", 0.0), 0.0))
         self.BASE_TILT_DEADBAND_RAD = float(cfg.base_tilt_deadband_rad)
         self.BASE_TILT_FULL_AUTHORITY_RAD = float(cfg.base_tilt_full_authority_rad)
         self.BASE_COMMAND_GAIN = float(cfg.base_command_gain)
@@ -485,10 +517,22 @@ class ControllerEvaluator:
         self.data.ctrl[:] = 0.0
 
         ang = math.radians(config.init_angle_deg)
-        self.data.qpos[self.q_pitch] = rng.uniform(-ang, ang)
-        self.data.qpos[self.q_roll] = rng.uniform(-ang, ang)
-        self.data.qpos[self.q_base_x] = rng.uniform(-config.init_base_pos_m, config.init_base_pos_m)
-        self.data.qpos[self.q_base_y] = rng.uniform(-config.init_base_pos_m, config.init_base_pos_m)
+        if config.init_pitch_deg_override is None:
+            self.data.qpos[self.q_pitch] = rng.uniform(-ang, ang)
+        else:
+            self.data.qpos[self.q_pitch] = float(np.radians(config.init_pitch_deg_override))
+        if config.init_roll_deg_override is None:
+            self.data.qpos[self.q_roll] = rng.uniform(-ang, ang)
+        else:
+            self.data.qpos[self.q_roll] = float(np.radians(config.init_roll_deg_override))
+        if config.init_base_x_m_override is None:
+            self.data.qpos[self.q_base_x] = rng.uniform(-config.init_base_pos_m, config.init_base_pos_m)
+        else:
+            self.data.qpos[self.q_base_x] = float(config.init_base_x_m_override)
+        if config.init_base_y_m_override is None:
+            self.data.qpos[self.q_base_y] = rng.uniform(-config.init_base_pos_m, config.init_base_pos_m)
+        else:
+            self.data.qpos[self.q_base_y] = float(config.init_base_y_m_override)
 
         if self.lock_root_attitude:
             self._enforce_planar_root_attitude(do_forward=False)
@@ -525,6 +569,8 @@ class ControllerEvaluator:
         params: CandidateParams,
         episode_seed: int,
         config: EpisodeConfig,
+        collect_disturbance_events: bool = False,
+        collect_pitch_phase_trace: bool = False,
     ) -> Dict[str, float]:
         rng = np.random.default_rng(episode_seed)
         self._reset_with_initial_state(rng, config)
@@ -580,11 +626,19 @@ class ControllerEvaluator:
         du_hits = 0
         control_updates = 0
         crash_step: Optional[int] = None
+        crash_reason = ""
+        crash_pitch_rate_rad_s = np.nan
+        crash_roll_rate_rad_s = np.nan
+        crash_wheel_rate_rad_s = np.nan
+        pitch_recovery_deadline_step: Optional[int] = None
         phase_switch_count = 0
         hold_steps = 0
         wheel_over_budget_count = 0
         wheel_over_hard_count = 0
         high_spin_steps = 0
+        disturbance_events: List[Dict[str, float]] = []
+        pitch_phase_trace: List[Dict[str, float | str]] = []
+        phase_switch_events: List[Dict[str, float | str]] = []
 
         family = str(getattr(config, "controller_family", "current"))
         low_spin_robust = (config.stability_profile == "low-spin-robust") and family in ("current", "hybrid_modern")
@@ -696,22 +750,33 @@ class ControllerEvaluator:
                 else:
                     base_int[:] = 0.0
 
-                if low_spin_robust:
-                    angle_mag = max(abs(float(x_true[0])), abs(float(x_true[1])))
-                    rate_mag = max(abs(float(x_true[2])), abs(float(x_true[3])))
-                    prev_phase = balance_phase
-                    if balance_phase == "recovery":
-                        if angle_mag < self.HOLD_ENTER_ANGLE_RAD and rate_mag < self.HOLD_ENTER_RATE_RAD_S:
-                            balance_phase = "hold"
-                            recovery_time_s = 0.0
-                    else:
-                        if angle_mag > self.HOLD_EXIT_ANGLE_RAD or rate_mag > self.HOLD_EXIT_RATE_RAD_S:
-                            balance_phase = "recovery"
-                            recovery_time_s = 0.0
-                    if balance_phase != prev_phase:
-                        phase_switch_count += 1
-                    if balance_phase == "recovery":
-                        recovery_time_s += control_dt
+                angle_mag = max(abs(float(x_true[0])), abs(float(x_true[1])))
+                rate_mag = max(abs(float(x_true[2])), abs(float(x_true[3])))
+                prev_phase = balance_phase
+                if balance_phase == "recovery":
+                    if angle_mag < self.HOLD_ENTER_ANGLE_RAD and rate_mag < self.HOLD_ENTER_RATE_RAD_S:
+                        balance_phase = "hold"
+                        recovery_time_s = 0.0
+                else:
+                    if angle_mag > self.HOLD_EXIT_ANGLE_RAD or rate_mag > self.HOLD_EXIT_RATE_RAD_S:
+                        balance_phase = "recovery"
+                        recovery_time_s = 0.0
+                if balance_phase != prev_phase:
+                    phase_switch_count += 1
+                    if collect_pitch_phase_trace:
+                        phase_switch_events.append(
+                            {
+                                "step": float(step),
+                                "time_s": float(step * self.dt),
+                                "from_phase": str(prev_phase),
+                                "to_phase": str(balance_phase),
+                                "pitch_rad": float(x_true[0]),
+                                "pitch_deg": float(np.degrees(float(x_true[0]))),
+                                "pitch_rate_rad_s": float(x_true[2]),
+                            }
+                        )
+                if balance_phase == "recovery":
+                    recovery_time_s += control_dt
 
                 z = np.concatenate([x_ctrl, u_eff_applied])
                 du_lqr = -k_du @ z
@@ -784,7 +849,11 @@ class ControllerEvaluator:
                             + (0.06 * self.BASE_ROLL_KP) * x_est[1]
                             + (0.06 * self.BASE_ROLL_KD) * x_est[3]
                         )
-                du_rw = float(np.clip(du_rw_cmd, -max_du[0], max_du[0]))
+                rw_du_limit = float(max_du[0])
+                if self.RW_EMERGENCY_DU_ENABLED and balance_phase != "hold":
+                    if abs(float(x_est[0])) >= self.RW_EMERGENCY_PITCH_RAD:
+                        rw_du_limit *= self.RW_EMERGENCY_DU_SCALE
+                du_rw = float(np.clip(du_rw_cmd, -rw_du_limit, rw_du_limit))
                 u_rw_unc = float(u_eff_applied[0] + du_rw)
                 u_rw_cmd = float(np.clip(u_rw_unc, -self.MAX_U[0], self.MAX_U[0]))
                 wheel_speed_abs_est = abs(float(x_est[4]))
@@ -896,6 +965,9 @@ class ControllerEvaluator:
                     balance_y += float(-0.25 * kf * self.MAX_U[2] * np.tanh(s_roll / max(np.radians(0.5), 1e-3)))
                 base_target_x = (1.0 - base_authority) * hold_x + base_authority * balance_x
                 base_target_y = (1.0 - base_authority) * hold_y + base_authority * balance_y
+                if balance_phase == "hold" and self.HOLD_BASE_X_CENTERING_GAIN > 0.0:
+                    hold_center_err_x = float(np.clip(x_est[5], -self.BASE_CENTERING_POS_CLIP_M, self.BASE_CENTERING_POS_CLIP_M))
+                    base_target_x += float(-self.HOLD_BASE_X_CENTERING_GAIN * hold_center_err_x)
                 if self.base_integrator_enabled:
                     base_target_x += -params.ki_base * base_int[0]
                     base_target_y += -params.ki_base * base_int[1]
@@ -947,7 +1019,7 @@ class ControllerEvaluator:
                     u_base_smooth += base_lpf_alpha * (u_base_cmd - u_base_smooth)
                     u_base_cmd = u_base_smooth.copy()
 
-                du_hits += int((abs(du_rw_cmd) > max_du[0]) or np.any(np.abs(du_base_cmd) > base_du_limit))
+                du_hits += int((abs(du_rw_cmd) > rw_du_limit) or np.any(np.abs(du_base_cmd) > base_du_limit))
                 sat_hits += int((abs(u_rw_unc) > self.MAX_U[0]) or np.any(np.abs(u_base_unc) > self.MAX_U[1:]))
                 u_cmd = np.array([u_rw_cmd, u_base_cmd[0], u_base_cmd[1]], dtype=float)
 
@@ -1072,6 +1144,19 @@ class ControllerEvaluator:
                         rng.uniform(-config.disturbance_magnitude_z, config.disturbance_magnitude_z) * disturbance_scale,
                     ]
                 )
+                if collect_disturbance_events:
+                    disturbance_events.append(
+                        {
+                            "step": float(step),
+                            "wheel_speed": float(self.data.qvel[self.v_rw]),
+                            "base_x_pos": float(self.data.qpos[self.q_base_x]),
+                            "pitch": float(self.data.qpos[self.q_pitch]),
+                            "pitch_rate": float(self.data.qvel[self.v_pitch]),
+                            "force_x": float(force[0]),
+                            "force_y": float(force[1]),
+                            "force_z": float(force[2]),
+                        }
+                    )
                 self.data.xfrc_applied[self.stick_body_id, :3] = force
             else:
                 self.data.xfrc_applied[self.stick_body_id, :3] = 0.0
@@ -1084,6 +1169,17 @@ class ControllerEvaluator:
             roll = float(self.data.qpos[self.q_roll])
             bx = float(self.data.qpos[self.q_base_x])
             by = float(self.data.qpos[self.q_base_y])
+            if collect_pitch_phase_trace:
+                pitch_phase_trace.append(
+                    {
+                        "step": float(step),
+                        "time_s": float(step * self.dt),
+                        "pitch_rad": pitch,
+                        "pitch_deg": float(np.degrees(pitch)),
+                        "pitch_rate_rad_s": float(self.data.qvel[self.v_pitch]),
+                        "phase": str(balance_phase),
+                    }
+                )
 
             max_pitch = max(max_pitch, abs(pitch))
             max_roll = max(max_roll, abs(roll))
@@ -1102,8 +1198,40 @@ class ControllerEvaluator:
             vx_series.append(float(self.data.qvel[self.v_base_x]))
             vy_series.append(float(self.data.qvel[self.v_base_y]))
 
-            if abs(pitch) >= tilt_fail_rad or abs(roll) >= tilt_fail_rad:
+            pitch_rate_now = float(self.data.qvel[self.v_pitch])
+            roll_rate_now = float(self.data.qvel[self.v_roll])
+            wheel_rate_now = float(self.data.qvel[self.v_rw])
+            pitch_failed = abs(pitch) >= tilt_fail_rad
+            roll_failed = abs(roll) >= tilt_fail_rad
+
+            pitch_crash_confirmed = False
+            pitch_crash_reason = "pitch_tilt"
+            if pitch_failed:
+                pitch_diverging = (abs(pitch_rate_now) > 1e-9) and (np.sign(pitch_rate_now) == np.sign(pitch))
+                if (not self.CRASH_DIVERGENCE_GATE_ENABLED) or pitch_diverging:
+                    pitch_crash_confirmed = True
+                    pitch_crash_reason = "pitch_tilt_diverging" if self.CRASH_DIVERGENCE_GATE_ENABLED else "pitch_tilt"
+                    pitch_recovery_deadline_step = None
+                elif self.CRASH_RECOVERY_WINDOW_STEPS <= 0:
+                    pitch_crash_confirmed = True
+                    pitch_crash_reason = "pitch_tilt_recovery_disabled"
+                    pitch_recovery_deadline_step = None
+                else:
+                    if pitch_recovery_deadline_step is None:
+                        pitch_recovery_deadline_step = step + self.CRASH_RECOVERY_WINDOW_STEPS
+                    if step >= pitch_recovery_deadline_step:
+                        pitch_crash_confirmed = True
+                        pitch_crash_reason = "pitch_tilt_recovery_timeout"
+                        pitch_recovery_deadline_step = None
+            else:
+                pitch_recovery_deadline_step = None
+
+            if pitch_crash_confirmed or roll_failed:
                 crash_step = step
+                crash_reason = pitch_crash_reason if pitch_crash_confirmed else "roll_tilt"
+                crash_pitch_rate_rad_s = pitch_rate_now
+                crash_roll_rate_rad_s = roll_rate_now
+                crash_wheel_rate_rad_s = wheel_rate_now
                 break
 
         steps_run = crash_step if crash_step is not None else config.steps
@@ -1122,10 +1250,32 @@ class ControllerEvaluator:
                 pred_vx_series=[float(v) for v in vx_series],
                 pred_vy_series=[float(v) for v in vy_series],
             )
-        return {
+        crash_preceding_step = None
+        if crash_step is not None and disturbance_events:
+            crash_preceding_candidates = [int(ev["step"]) for ev in disturbance_events if int(ev["step"]) <= int(crash_step)]
+            if crash_preceding_candidates:
+                crash_preceding_step = max(crash_preceding_candidates)
+        survivor_reference_step = None
+        if crash_step is None and disturbance_events:
+            survivor_reference_step = max(int(ev["step"]) for ev in disturbance_events)
+        for ev in disturbance_events:
+            ev_step = int(ev["step"])
+            ev["episode_seed"] = float(episode_seed)
+            ev["episode_crashed"] = 1.0 if crash_step is not None else 0.0
+            ev["crash_step"] = float(crash_step) if crash_step is not None else np.nan
+            ev["is_crash_preceding"] = 1.0 if (crash_preceding_step is not None and ev_step == crash_preceding_step) else 0.0
+            ev["is_survivor_reference"] = (
+                1.0 if (survivor_reference_step is not None and ev_step == survivor_reference_step) else 0.0
+            )
+
+        result = {
             "survived": 1.0 if crash_step is None else 0.0,
             "crash_count": 0.0 if crash_step is None else 1.0,
             "crash_step": float(crash_step) if crash_step is not None else np.nan,
+            "crash_reason": crash_reason,
+            "crash_pitch_rate_rad_s": crash_pitch_rate_rad_s,
+            "crash_roll_rate_rad_s": crash_roll_rate_rad_s,
+            "crash_wheel_rate_rad_s": crash_wheel_rate_rad_s,
             "max_abs_pitch_deg": float(np.degrees(max_pitch)),
             "max_abs_roll_deg": float(np.degrees(max_roll)),
             "max_abs_base_x_m": max_base_x,
@@ -1146,6 +1296,12 @@ class ControllerEvaluator:
             "sim_real_consistency": float(hw_consistency),
             "sim_real_traj_nrmse": float(hw_traj_nrmse),
         }
+        if collect_disturbance_events:
+            result["disturbance_events"] = disturbance_events
+        if collect_pitch_phase_trace:
+            result["pitch_phase_trace"] = pitch_phase_trace
+            result["phase_switch_events"] = phase_switch_events
+        return result
 
     def evaluate_candidate(
         self,
@@ -1184,6 +1340,20 @@ class ControllerEvaluator:
         score_composite = float(np.mean(episode_score_list))
         score_p5 = float(np.quantile(np.asarray(episode_score_list, dtype=float), 0.05)) if episode_score_list else np.nan
         score_p1 = float(np.quantile(np.asarray(episode_score_list, dtype=float), 0.01)) if episode_score_list else np.nan
+        crash_pitch_rate_vals = np.asarray([m.get("crash_pitch_rate_rad_s", np.nan) for m in per_episode], dtype=float)
+        crash_roll_rate_vals = np.asarray([m.get("crash_roll_rate_rad_s", np.nan) for m in per_episode], dtype=float)
+        crash_wheel_rate_vals = np.asarray([m.get("crash_wheel_rate_rad_s", np.nan) for m in per_episode], dtype=float)
+        crash_pitch_rate_vals = crash_pitch_rate_vals[np.isfinite(crash_pitch_rate_vals)]
+        crash_roll_rate_vals = crash_roll_rate_vals[np.isfinite(crash_roll_rate_vals)]
+        crash_wheel_rate_vals = crash_wheel_rate_vals[np.isfinite(crash_wheel_rate_vals)]
+        crash_pitch_rate_mean = float(np.mean(crash_pitch_rate_vals)) if crash_pitch_rate_vals.size else np.nan
+        crash_pitch_rate_abs_mean = float(np.mean(np.abs(crash_pitch_rate_vals))) if crash_pitch_rate_vals.size else np.nan
+        crash_pitch_rate_pos_frac = float(np.mean(crash_pitch_rate_vals > 0.0)) if crash_pitch_rate_vals.size else np.nan
+        crash_pitch_rate_neg_frac = float(np.mean(crash_pitch_rate_vals < 0.0)) if crash_pitch_rate_vals.size else np.nan
+        crash_roll_rate_mean = float(np.mean(crash_roll_rate_vals)) if crash_roll_rate_vals.size else np.nan
+        crash_wheel_rate_abs_mean = (
+            float(np.mean(np.abs(crash_wheel_rate_vals))) if crash_wheel_rate_vals.size else np.nan
+        )
 
         crash_steps = [m["crash_step"] for m in per_episode if not np.isnan(m["crash_step"])]
         worst_crash_step = float(np.min(crash_steps)) if crash_steps else np.nan
@@ -1245,6 +1415,12 @@ class ControllerEvaluator:
             "sim_real_traj_nrmse_mean": sim_real_traj_nrmse_mean,
             "crash_count_total": crash_count_total,
             "crash_rate": crash_rate,
+            "crash_pitch_rate_mean_rad_s": crash_pitch_rate_mean,
+            "crash_pitch_rate_abs_mean_rad_s": crash_pitch_rate_abs_mean,
+            "crash_pitch_rate_pos_frac": crash_pitch_rate_pos_frac,
+            "crash_pitch_rate_neg_frac": crash_pitch_rate_neg_frac,
+            "crash_roll_rate_mean_rad_s": crash_roll_rate_mean,
+            "crash_wheel_rate_abs_mean_rad_s": crash_wheel_rate_abs_mean,
             "failure_reason": failure_reason,
             "confidence_tier": confidence_tier,
             "hardware_realistic": bool(runtime_cfg_for_episode.hardware_realistic),
@@ -1357,6 +1533,12 @@ def safe_evaluate_candidate(
             "episode_score_list": [],
             "crash_rate": 1.0,
             "crash_count_total": float(len(episode_seeds)),
+            "crash_pitch_rate_mean_rad_s": np.nan,
+            "crash_pitch_rate_abs_mean_rad_s": np.nan,
+            "crash_pitch_rate_pos_frac": np.nan,
+            "crash_pitch_rate_neg_frac": np.nan,
+            "crash_roll_rate_mean_rad_s": np.nan,
+            "crash_wheel_rate_abs_mean_rad_s": np.nan,
             "accepted_gate": False,
             "worst_crash_step": np.nan,
             "worst_pitch_deg": np.nan,

@@ -1,5 +1,15 @@
 # MuJoCo Reaction Wheel Balancer
 
+![Status](https://img.shields.io/badge/status-active_research-orange)
+![Scope](https://img.shields.io/badge/scope-simulation_only-blue)
+![Maintained](https://img.shields.io/badge/maintained_path-final%2F-green)
+![Evidence](https://img.shields.io/badge/claims-artifact_backed-brightgreen)
+
+**Project Status (Quick Read):**
+- Maturity: active development and benchmarking, not a frozen release.
+- Primary code path: `final/`.
+- Ground truth for claims: saved benchmark artifacts in `final/results/`.
+
 This repository is a simulation-first control project for a balancing robot with a reaction wheel and a moving base.
 
 It is written for two audiences:
@@ -14,6 +24,19 @@ It is written for two audiences:
 - `archive/`: legacy prototypes and historical logs moved out of the root.
 - `web/`: browser viewer side quest.
 - `wheel-base-controller-release/`: standalone minimal wheel+base package snapshot.
+
+## 0.5) Current Status and Transparency (as of 2026-02-21)
+
+- This repo is an active research/dev sandbox, not a frozen release.
+- The only actively maintained control stack is under `final/`.
+- Historical files/prototypes are retained in `archive/` for traceability, not as recommended entry points.
+- The benchmark table in this README (`2026-02-16` snapshot) is a reproducible reference point, not a claim that all newer stress cases are solved.
+- Recent fixed-seed stress diagnostics (`seed=42`, 80 episodes, high disturbance profile) are stored in:
+  - `final/results/throughput_ablation_seed42.json`
+  - `final/results/throughput_ablation_seed42_extra.json`
+- Current dominant failure mode in those stress diagnostics is trajectory/phase recovery throughput under repeated disturbances, not a simple control-sign inversion.
+- Optional features (`--enable-dob`, `--enable-gain-scheduling`, residual model path) are experimental and should be treated as such unless benchmarked with saved artifacts.
+- Development and review are AI-assisted; benchmark artifacts and reproducible scripts are the source of truth for project claims.
 
 ## 1) Non-Technical Overview
 

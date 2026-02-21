@@ -526,6 +526,7 @@ def main():
     com_over_support_steps = 0
     com_fail_streak = 0
     com_overload_failures = 0
+    pitch_recovery_deadline_step = None
     prev_script_force = np.zeros(3, dtype=float)
     control_terms_writer = None
     control_terms_file = None
@@ -601,6 +602,7 @@ def main():
                 "step",
                 "sim_time_s",
                 "event",
+                "crash_reason",
                 "controller_family",
                 "balance_phase",
                 "pitch",
@@ -677,6 +679,7 @@ def main():
                 dob_raw[:] = 0.0
                 dob_prev_x_est = None
                 gain_schedule_scale_state = 1.0
+                pitch_recovery_deadline_step = None
                 reset_sensor_frontend_state(sensor_frontend_state)
                 continue
 
@@ -999,31 +1002,62 @@ def main():
                     f"com_xy={com_planar_dist:6.3f}m"
                 )
 
+            pitch_rate_now = float(data.qvel[ids.v_pitch])
+            roll_rate_now = float(data.qvel[ids.v_roll])
+            wheel_rate_now = float(data.qvel[ids.v_rw])
+
             pitch_failed = abs(pitch) >= cfg.crash_angle_rad
             roll_failed = abs(roll) >= cfg.crash_angle_rad
-            tilt_failed = pitch_failed or roll_failed
+            pitch_crash_confirmed = False
+            pitch_crash_reason = "pitch_tilt"
+            if pitch_failed:
+                pitch_diverging = (abs(pitch_rate_now) > 1e-9) and (np.sign(pitch_rate_now) == np.sign(pitch))
+                if (not cfg.crash_divergence_gate_enabled) or pitch_diverging:
+                    pitch_crash_confirmed = True
+                    pitch_crash_reason = "pitch_tilt_diverging" if cfg.crash_divergence_gate_enabled else "pitch_tilt"
+                    pitch_recovery_deadline_step = None
+                elif cfg.crash_recovery_window_steps <= 0:
+                    pitch_crash_confirmed = True
+                    pitch_crash_reason = "pitch_tilt_recovery_disabled"
+                    pitch_recovery_deadline_step = None
+                else:
+                    if pitch_recovery_deadline_step is None:
+                        pitch_recovery_deadline_step = step_count + cfg.crash_recovery_window_steps
+                    if step_count >= pitch_recovery_deadline_step:
+                        pitch_crash_confirmed = True
+                        pitch_crash_reason = "pitch_tilt_recovery_timeout"
+                        pitch_recovery_deadline_step = None
+            else:
+                pitch_recovery_deadline_step = None
+
+            tilt_failed = pitch_crash_confirmed or roll_failed
             com_failed = com_fail_streak >= cfg.payload_com_fail_steps
             if tilt_failed or com_failed:
                 crash_count += 1
                 com_overload_failures += int(com_failed)
+                pitch_rate_at_crash = pitch_rate_now
+                roll_rate_at_crash = roll_rate_now
+                wheel_rate_at_crash = wheel_rate_now
+                crash_reason = "com_overload" if com_failed else (pitch_crash_reason if pitch_crash_confirmed else "roll_tilt")
                 if trace_events_writer is not None:
                     trace_events_writer.writerow(
                         {
                             "step": step_count,
                             "sim_time_s": float(data.time),
                             "event": "crash",
+                            "crash_reason": crash_reason,
                             "controller_family": cfg.controller_family,
                             "balance_phase": balance_phase,
                             "pitch": float(pitch),
                             "roll": float(roll),
-                            "pitch_rate": float(data.qvel[ids.v_pitch]),
-                            "roll_rate": float(data.qvel[ids.v_roll]),
-                            "wheel_rate": float(data.qvel[ids.v_rw]),
-                            "wheel_rate_abs": float(abs(data.qvel[ids.v_rw])),
+                            "pitch_rate": pitch_rate_at_crash,
+                            "roll_rate": roll_rate_at_crash,
+                            "wheel_rate": wheel_rate_at_crash,
+                            "wheel_rate_abs": float(abs(wheel_rate_at_crash)),
                             "wheel_budget_speed": float(wheel_budget_speed),
                             "wheel_hard_speed": float(wheel_hard_speed),
-                            "wheel_over_budget": int(abs(float(data.qvel[ids.v_rw])) > wheel_budget_speed),
-                            "wheel_over_hard": int(abs(float(data.qvel[ids.v_rw])) > wheel_hard_speed),
+                            "wheel_over_budget": int(abs(wheel_rate_at_crash) > wheel_budget_speed),
+                            "wheel_over_hard": int(abs(wheel_rate_at_crash) > wheel_hard_speed),
                             "high_spin_active": int(high_spin_active),
                             "base_x": float(data.qpos[ids.q_base_x]),
                             "base_y": float(data.qpos[ids.q_base_y]),
@@ -1038,12 +1072,13 @@ def main():
                 print(
                     f"\nCRASH #{crash_count} at step {step_count}: "
                     f"pitch={np.degrees(pitch):.2f}deg roll={np.degrees(roll):.2f}deg "
-                    f"pitch_rate={float(data.qvel[ids.v_pitch]):.3f}rad/s "
-                    f"roll_rate={float(data.qvel[ids.v_roll]):.3f}rad/s "
-                    f"wheel_rate={float(data.qvel[ids.v_rw]):.2f}rad/s "
+                    f"pitch_rate={pitch_rate_at_crash:.3f}rad/s "
+                    f"roll_rate={roll_rate_at_crash:.3f}rad/s "
+                    f"wheel_rate={wheel_rate_at_crash:.2f}rad/s "
                     f"com_xy={com_planar_dist:.3f}m "
-                    f"reason={'com_overload' if com_failed else ('pitch_tilt' if pitch_failed else 'roll_tilt')}"
+                    f"reason={crash_reason}"
                 )
+                print(f"CRASH_PITCH_RATE_RAD_S={pitch_rate_at_crash:+.3f}")
                 if cfg.stop_on_crash:
                     break
                 reset_state(model, data, ids.q_pitch, ids.q_roll, pitch_eq=0.0, roll_eq=initial_roll_rad)
@@ -1068,6 +1103,7 @@ def main():
                 dob_raw[:] = 0.0
                 dob_prev_x_est = None
                 gain_schedule_scale_state = 1.0
+                pitch_recovery_deadline_step = None
                 reset_sensor_frontend_state(sensor_frontend_state)
                 continue
 
