@@ -1,4 +1,4 @@
-# MuJoCo Reaction Wheel Balancer
+# Self-Balancing Unicycle Robot
 
 ![Status](https://img.shields.io/badge/status-active_research-orange)
 ![Scope](https://img.shields.io/badge/scope-simulation_only-blue)
