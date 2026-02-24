@@ -117,6 +117,45 @@ def lift_discrete_dynamics(A: np.ndarray, B: np.ndarray, steps: int) -> tuple[np
     return A_lift, B_lift
 
 
+def _render_drag_force_arrow(
+    viewer: mujoco.viewer.Handle,
+    data: mujoco.MjData,
+    body_id: int,
+    force_world: np.ndarray,
+    anchor_world: np.ndarray | None = None,
+) -> None:
+    """Draw a red world-space arrow showing current mouse drag force direction."""
+    with viewer.lock():
+        viewer.user_scn.ngeom = 0
+        if viewer.user_scn.maxgeom < 1:
+            return
+        force_mag = float(np.linalg.norm(force_world))
+        if force_mag <= 1e-6:
+            return
+
+        if anchor_world is not None and np.all(np.isfinite(anchor_world)):
+            start = np.array(anchor_world, dtype=float)
+        else:
+            if body_id <= 0 or body_id >= data.xipos.shape[0]:
+                return
+            start = np.array(data.xipos[body_id], dtype=float)
+        direction = force_world / force_mag
+        length = float(np.clip(0.02 * force_mag, 0.08, 0.45))
+        end = start + direction * length
+
+        geom = viewer.user_scn.geoms[0]
+        mujoco.mjv_initGeom(
+            geom,
+            mujoco.mjtGeom.mjGEOM_ARROW,
+            np.zeros(3, dtype=float),
+            np.zeros(3, dtype=float),
+            np.eye(3, dtype=float).reshape(9),
+            np.array([1.0, 0.1, 0.1, 0.95], dtype=np.float32),
+        )
+        mujoco.mjv_connector(geom, mujoco.mjtGeom.mjGEOM_ARROW, 0.02, start, end)
+        viewer.user_scn.ngeom = 1
+
+
 def main():
     # 1) Parse CLI and build runtime tuning/safety profile.
     args = parse_args()
@@ -713,13 +752,38 @@ def main():
 
     # 5) Closed-loop runtime: estimate -> control -> clamp -> simulate -> render.
     with mujoco.viewer.launch_passive(model, data) as viewer:
+        with viewer.lock():
+            # Hide MuJoCo's default perturb box/force markers; we render a directional arrow instead.
+            viewer.opt.flags[mujoco.mjtVisFlag.mjVIS_PERTOBJ] = 0
+            viewer.opt.flags[mujoco.mjtVisFlag.mjVIS_PERTFORCE] = 0
+            viewer.user_scn.ngeom = 0
         while viewer.is_running():
             step_count += 1
+            drag_anchor_body = -1
+            drag_force_world = np.zeros(3, dtype=float)
+            drag_anchor_world = None
             # Pull GUI events/perturbations before control+step so dragging is applied immediately.
             viewer.sync()
             if np.any(prev_script_force):
                 data.xfrc_applied[push_body_id, :3] -= prev_script_force
                 prev_script_force[:] = 0.0
+            selected_body = int(viewer.perturb.select)
+            drag_wrench_world = np.zeros(6, dtype=float)
+            if 0 < selected_body < model.nbody:
+                drag_wrench_world = np.array(data.xfrc_applied[selected_body, :6], dtype=float)
+            # Route mouse drag wrench to root body so dragging any clicked part moves the whole robot assembly.
+            data.xfrc_applied[:, :] = 0.0
+            if args.planar_perturb:
+                drag_wrench_world[2] = 0.0
+            if np.any(np.abs(drag_wrench_world) > 1e-9):
+                data.xfrc_applied[ids.base_x_body_id, :6] = drag_wrench_world
+                drag_anchor_body = selected_body
+                drag_force_world = np.array(drag_wrench_world[:3], dtype=float)
+                if 0 < selected_body < model.nbody:
+                    local_hit = np.array(viewer.perturb.localpos, dtype=float)
+                    if np.all(np.isfinite(local_hit)):
+                        rot = data.xmat[selected_body].reshape(3, 3)
+                        drag_anchor_world = np.array(data.xpos[selected_body], dtype=float) + rot @ local_hit
             if cfg.wheel_only:
                 enforce_wheel_only_constraints(model, data, ids, lock_root_attitude=cfg.lock_root_attitude)
             else:
@@ -1081,6 +1145,7 @@ def main():
                 com_fail_streak += 1
             else:
                 com_fail_streak = 0
+            _render_drag_force_arrow(viewer, data, drag_anchor_body, drag_force_world, anchor_world=drag_anchor_world)
             # Push latest state to viewer.
             viewer.sync()
 
