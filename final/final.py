@@ -352,6 +352,12 @@ def main():
     print(f"lock_root_attitude={cfg.lock_root_attitude}")
     print(f"seed={cfg.seed}")
     print(
+        "Viewer interaction: "
+        "left-double-click selects a body; hold Ctrl and drag to apply force/torque; "
+        "drag without Ctrl moves the camera."
+    )
+    print(f"Viewer perturb helpers: planar_perturb={args.planar_perturb} drag_assist={args.drag_assist}")
+    print(
         f"hardware_realistic={cfg.hardware_realistic} control_hz={cfg.control_hz:.1f} "
         f"delay_steps={cfg.control_delay_steps} wheel_ticks={cfg.wheel_encoder_ticks_per_rev}"
     )

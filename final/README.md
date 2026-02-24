@@ -220,6 +220,17 @@ python final/final.py --mode robust --controller-family current_dob --dob-cutoff
 python final/final.py --use-mpc --mode robust
 ```
 
+Mouse interaction in the viewer:
+
+1. Left-double-click a body to select it.
+2. Hold `Ctrl` and drag the mouse to apply force/torque to the selected body.
+3. Drag without `Ctrl` to move the camera.
+
+Useful runtime flags for manual perturbation sessions:
+
+1. `--planar-perturb` / `--no-planar-perturb`: keep/remove Z-force clamping during perturbation.
+2. `--drag-assist` / `--no-drag-assist`: temporarily scale controller effort while mouse perturbation is active.
+
 ### 5.3 Run Reproducible Benchmark (Headless)
 
 ```powershell
