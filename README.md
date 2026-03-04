@@ -193,6 +193,11 @@ Optional for residual correction:
 pip install torch
 ```
 
+Optional for serial telemetry transport:
+```bash
+pip install pyserial
+```
+
 Viewer run:
 ```bash
 python final/final.py --mode smooth
@@ -242,6 +247,24 @@ Open `http://localhost:8090/web/` and use the payload mass controls.
 Wheel-spin diagnostics:
 - runtime summary now reports signed wheel speed peaks, mean absolute wheel speed, over-budget/over-hard ratios (total and sign-split), and hard-zone suppression counters for tuning.
 - `--log-control-terms` and `--trace-events-csv` include wheel-rate/budget/hard telemetry fields.
+
+Live telemetry + plotting (sim-first, serial-ready):
+- Start the plotter (terminal 1):
+```bash
+python final/telemetry_plotter.py --source udp --udp-port 9871 --window-s 12
+```
+- Start the simulator telemetry stream (terminal 2):
+```bash
+python final/final.py --mode smooth --telemetry --telemetry-transport udp --telemetry-udp-host 127.0.0.1 --telemetry-udp-port 9871
+```
+- Serial path for hardware bring-up (same plotter UI, different source):
+```bash
+python final/telemetry_plotter.py --source serial --serial-port COM7 --serial-baud 115200
+```
+```bash
+python final/final.py --mode smooth --telemetry --telemetry-transport serial --telemetry-serial-port COM6 --telemetry-serial-baud 115200
+```
+- For serial mode install `pyserial`; for plotting install `matplotlib`.
 
 ### 2.6 Firmware relevance
 

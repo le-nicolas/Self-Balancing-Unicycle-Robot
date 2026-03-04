@@ -196,6 +196,13 @@ class RuntimeConfig:
     log_control_terms: bool
     control_terms_csv: str | None
     trace_events_csv: str | None
+    telemetry_enabled: bool
+    telemetry_transport: str
+    telemetry_rate_hz: float
+    telemetry_udp_host: str
+    telemetry_udp_port: int
+    telemetry_serial_port: str | None
+    telemetry_serial_baud: int
     preset: str
     stability_profile: str
     stable_demo_profile: bool
@@ -422,6 +429,48 @@ def parse_args(argv=None):
         type=str,
         default=None,
         help="Optional runtime trace/event CSV path for replay alignment.",
+    )
+    parser.add_argument(
+        "--telemetry",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Enable live telemetry streaming for external plotting/debugging.",
+    )
+    parser.add_argument(
+        "--telemetry-transport",
+        choices=["udp", "serial"],
+        default="udp",
+        help="Telemetry transport. Use UDP for sim-first bring-up, serial for hardware link testing.",
+    )
+    parser.add_argument(
+        "--telemetry-rate-hz",
+        type=float,
+        default=60.0,
+        help="Telemetry publish rate cap. 0 disables rate limiting (publish every control update).",
+    )
+    parser.add_argument(
+        "--telemetry-udp-host",
+        type=str,
+        default="127.0.0.1",
+        help="UDP host/address target for telemetry when --telemetry-transport udp.",
+    )
+    parser.add_argument(
+        "--telemetry-udp-port",
+        type=int,
+        default=9871,
+        help="UDP port target for telemetry when --telemetry-transport udp.",
+    )
+    parser.add_argument(
+        "--telemetry-serial-port",
+        type=str,
+        default=None,
+        help="Serial COM/TTY for telemetry when --telemetry-transport serial (e.g. COM7 or /dev/ttyUSB0).",
+    )
+    parser.add_argument(
+        "--telemetry-serial-baud",
+        type=int,
+        default=115200,
+        help="Serial baud rate for telemetry when --telemetry-transport serial.",
     )
     parser.add_argument(
         "--residual-model",
@@ -1554,6 +1603,17 @@ def build_config(args) -> RuntimeConfig:
     else:
         sensor_hz = max(float(sensor_hz_arg), 1.0)
     sensor_delay_steps = max(int(getattr(args, "sensor_delay_steps", 0)), 0)
+    telemetry_enabled = bool(getattr(args, "telemetry", False))
+    telemetry_transport = str(getattr(args, "telemetry_transport", "udp")).strip().lower()
+    if telemetry_transport not in {"udp", "serial"}:
+        telemetry_transport = "udp"
+    telemetry_rate_hz = float(max(float(getattr(args, "telemetry_rate_hz", 60.0)), 0.0))
+    telemetry_udp_host = str(getattr(args, "telemetry_udp_host", "127.0.0.1")).strip() or "127.0.0.1"
+    telemetry_udp_port = int(getattr(args, "telemetry_udp_port", 9871))
+    telemetry_udp_port = int(np.clip(telemetry_udp_port, 1, 65535))
+    telemetry_serial_port_arg = getattr(args, "telemetry_serial_port", None)
+    telemetry_serial_port = str(telemetry_serial_port_arg).strip() if telemetry_serial_port_arg else None
+    telemetry_serial_baud = int(max(int(getattr(args, "telemetry_serial_baud", 115200)), 1200))
 
     residual_scale = float(max(getattr(args, "residual_scale", 0.0), 0.0))
     residual_max_abs_u = np.array(
@@ -1612,6 +1672,13 @@ def build_config(args) -> RuntimeConfig:
         log_control_terms=bool(getattr(args, "log_control_terms", False)),
         control_terms_csv=getattr(args, "control_terms_csv", None),
         trace_events_csv=getattr(args, "trace_events_csv", None),
+        telemetry_enabled=telemetry_enabled,
+        telemetry_transport=telemetry_transport,
+        telemetry_rate_hz=telemetry_rate_hz,
+        telemetry_udp_host=telemetry_udp_host,
+        telemetry_udp_port=telemetry_udp_port,
+        telemetry_serial_port=telemetry_serial_port,
+        telemetry_serial_baud=telemetry_serial_baud,
         preset=preset,
         stability_profile=stability_profile,
         stable_demo_profile=stable_demo_profile,

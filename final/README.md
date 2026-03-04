@@ -205,6 +205,7 @@ pip install osqp matplotlib pytest
 Optional:
 
 1. `pip install torch` if you want residual model support.
+2. `pip install pyserial` if you want serial telemetry transport.
 
 Runtime tuning:
 
@@ -218,6 +219,23 @@ python final/final.py --mode smooth
 python final/final.py --mode robust
 python final/final.py --mode robust --controller-family current_dob --dob-cutoff-hz 5.0
 python final/final.py --use-mpc --mode robust
+```
+
+Live telemetry plotting (sim-first):
+
+```powershell
+python final/telemetry_plotter.py --source udp --udp-port 9871 --window-s 12
+```
+
+```powershell
+python final/final.py --mode smooth --telemetry --telemetry-transport udp --telemetry-udp-host 127.0.0.1 --telemetry-udp-port 9871
+```
+
+Serial-mode path for real hardware bring-up:
+
+```powershell
+python final/telemetry_plotter.py --source serial --serial-port COM7 --serial-baud 115200
+python final/final.py --mode smooth --telemetry --telemetry-transport serial --telemetry-serial-port COM6 --telemetry-serial-baud 115200
 ```
 
 Mouse interaction in the viewer:

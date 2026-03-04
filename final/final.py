@@ -37,6 +37,7 @@ from control_core import (
 )
 from residual_model import ResidualPolicy
 from adaptive_id import AdaptiveGainScheduler
+from telemetry_stream import create_telemetry_publisher
 
 """
 Teaching-oriented MuJoCo balancing controller.
@@ -401,6 +402,16 @@ def main():
         f"delay_steps={cfg.control_delay_steps} wheel_ticks={cfg.wheel_encoder_ticks_per_rev}"
     )
     print(
+        "Telemetry: "
+        f"enabled={cfg.telemetry_enabled} "
+        f"transport={cfg.telemetry_transport} "
+        f"rate_hz={cfg.telemetry_rate_hz:.1f}"
+    )
+    if cfg.telemetry_transport == "udp":
+        print(f"Telemetry endpoint (udp): {cfg.telemetry_udp_host}:{cfg.telemetry_udp_port}")
+    else:
+        print(f"Telemetry endpoint (serial): {cfg.telemetry_serial_port}@{cfg.telemetry_serial_baud}")
+    print(
         f"dynamics_dt_model={model.opt.timestep:.6f}s "
         f"design_dt_control={control_dt:.6f}s "
         f"(control_steps={control_steps})"
@@ -749,6 +760,13 @@ def main():
             ],
         )
         trace_events_writer.writeheader()
+    telemetry_publisher = create_telemetry_publisher(cfg)
+    if cfg.telemetry_enabled:
+        print(
+            "Telemetry publisher: "
+            f"{'active' if telemetry_publisher.active else 'inactive'} "
+            f"endpoint={telemetry_publisher.endpoint}"
+        )
 
     # 5) Closed-loop runtime: estimate -> control -> clamp -> simulate -> render.
     with mujoco.viewer.launch_passive(model, data) as viewer:
@@ -1062,6 +1080,41 @@ def main():
                         }
                     )
                 u_applied = apply_control_delay(cfg, cmd_queue, u_cmd)
+                telemetry_publisher.publish(
+                    sim_time_s=float(data.time),
+                    frame={
+                        "schema": "mujoco_telemetry_v1",
+                        "source": "sim",
+                        "controller_family": cfg.controller_family,
+                        "step": int(step_count),
+                        "control_update": int(control_updates),
+                        "sim_time_s": float(data.time),
+                        "balance_phase": balance_phase,
+                        "pitch_rad": float(x_true[0]),
+                        "roll_rad": float(x_true[1]),
+                        "pitch_rate_rad_s": float(x_true[2]),
+                        "roll_rate_rad_s": float(x_true[3]),
+                        "wheel_rate_rad_s": float(x_true[4]),
+                        "base_x_m": float(x_true[5]),
+                        "base_y_m": float(x_true[6]),
+                        "base_vx_m_s": float(x_true[7]),
+                        "base_vy_m_s": float(x_true[8]),
+                        "pitch_est_rad": float(x_est[0]),
+                        "roll_est_rad": float(x_est[1]),
+                        "u_rw_cmd": float(u_cmd[0]),
+                        "u_bx_cmd": float(u_cmd[1]),
+                        "u_by_cmd": float(u_cmd[2]),
+                        "u_rw_delayed": float(u_applied[0]),
+                        "u_bx_delayed": float(u_applied[1]),
+                        "u_by_delayed": float(u_applied[2]),
+                        "high_spin_active": int(high_spin_active),
+                        "wheel_budget_speed_rad_s": float(wheel_budget_speed),
+                        "wheel_hard_speed_rad_s": float(wheel_hard_speed),
+                        "disturbance_level": float(control_terms["disturbance_level"][0]),
+                        "gain_schedule_scale": float(control_terms["gain_schedule_scale"][0]),
+                        "com_planar_dist_m": float(com_planar_dist),
+                    },
+                )
             if balance_phase == "hold":
                 hold_steps += 1
             if high_spin_active:
@@ -1275,6 +1328,7 @@ def main():
         control_terms_file.close()
     if trace_events_file is not None:
         trace_events_file.close()
+    telemetry_publisher.close()
 
     print("\n=== SIMULATION ENDED ===")
     print(f"Total steps: {step_count}")
@@ -1344,6 +1398,12 @@ def main():
     print(f"Residual clipped count: {residual_clipped_count}")
     print(f"Residual gate-blocked count: {residual_gate_blocked_count}")
     print(f"Residual max |delta_u| [rw,bx,by]: {residual_max_abs}")
+    if cfg.telemetry_enabled:
+        print(
+            "Telemetry frames: "
+            f"sent={telemetry_publisher.sent_frames} "
+            f"dropped={telemetry_publisher.dropped_frames}"
+        )
 
 
 if __name__ == "__main__":
