@@ -537,8 +537,8 @@ def compute_control_command(
         sat_hits[0] += int(abs(u_rw_unc) > rw_u_limit)
         u_rw_cmd = float(np.clip(u_rw_unc, -rw_u_limit, rw_u_limit))
 
-        hold_x = -cfg.base_damping_gain * x_est[7] - cfg.base_centering_gain * x_est[5]
-        hold_y = -cfg.base_damping_gain * x_est[8] - cfg.base_centering_gain * x_est[6]
+        hold_x = -cfg.base_damping_gain * x_est[7] - cfg.base_centering_gain * x_ctrl[5]
+        hold_y = -cfg.base_damping_gain * x_est[8] - cfg.base_centering_gain * x_ctrl[6]
         terms["term_base_hold"][1:] = np.array([hold_x, hold_y], dtype=float)
         if cfg.allow_base_motion:
             balance_x = cfg.base_command_gain * (cfg.base_pitch_kp * x_est[0] + cfg.base_pitch_kd * x_est[2])
@@ -730,13 +730,13 @@ def compute_control_command(
         
         follow_alpha = float(np.clip(cfg.base_ref_follow_rate_hz * control_dt, 0.0, 1.0))
         recenter_alpha = float(np.clip(cfg.base_ref_recenter_rate_hz * control_dt, 0.0, 1.0))
-        base_disp = float(np.hypot(x_est[5], x_est[6]))
+        base_disp = float(np.hypot(x_est[5] - cfg.x_ref, x_est[6] - cfg.y_ref))
         if base_authority > 0.35 and base_disp < cfg.base_hold_radius_m:
             base_ref[0] += follow_alpha * (x_est[5] - base_ref[0])
             base_ref[1] += follow_alpha * (x_est[6] - base_ref[1])
         else:
-            base_ref[0] += recenter_alpha * (0.0 - base_ref[0])
-            base_ref[1] += recenter_alpha * (0.0 - base_ref[1])
+            base_ref[0] += recenter_alpha * (cfg.x_ref - base_ref[0])
+            base_ref[1] += recenter_alpha * (cfg.y_ref - base_ref[1])
 
         base_x_err = float(np.clip(x_est[5] - base_ref[0], -cfg.base_centering_pos_clip_m, cfg.base_centering_pos_clip_m))
         base_y_err = float(np.clip(x_est[6] - base_ref[1], -cfg.base_centering_pos_clip_m, cfg.base_centering_pos_clip_m))
@@ -761,7 +761,9 @@ def compute_control_command(
         base_target_y = (1.0 - base_authority) * hold_y + base_authority * balance_y
         hold_center_x = 0.0
         if balance_phase == "hold" and cfg.hold_base_x_centering_gain > 0.0:
-            hold_center_err_x = float(np.clip(x_est[5], -cfg.base_centering_pos_clip_m, cfg.base_centering_pos_clip_m))
+            hold_center_err_x = float(
+                np.clip(x_est[5] - cfg.x_ref, -cfg.base_centering_pos_clip_m, cfg.base_centering_pos_clip_m)
+            )
             hold_center_x = float(-cfg.hold_base_x_centering_gain * hold_center_err_x)
             base_target_x += hold_center_x
             terms["term_base_hold"][1] += hold_center_x
@@ -851,13 +853,15 @@ def apply_upright_postprocess(
     despin_gain: float,
     rw_u_limit: float,
 ):
+    x_rel = float(x_true[5] - cfg.x_ref)
+    y_rel = float(x_true[6] - cfg.y_ref)
     near_upright = (
         abs(x_true[0]) < cfg.upright_angle_thresh
         and abs(x_true[1]) < cfg.upright_angle_thresh
         and abs(x_true[2]) < cfg.upright_vel_thresh
         and abs(x_true[3]) < cfg.upright_vel_thresh
-        and abs(x_true[5]) < cfg.upright_pos_thresh
-        and abs(x_true[6]) < cfg.upright_pos_thresh
+        and abs(x_rel) < cfg.upright_pos_thresh
+        and abs(y_rel) < cfg.upright_pos_thresh
     )
     quasi_upright = (
         abs(x_true[0]) < 1.8 * cfg.upright_angle_thresh

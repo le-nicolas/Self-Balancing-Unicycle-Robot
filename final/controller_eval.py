@@ -74,6 +74,19 @@ class EpisodeConfig:
     payload_mass_kg: float = 0.0
     payload_support_radius_m: float = 0.145
     payload_com_fail_steps: int = 15
+    trajectory_profile: str = "none"
+    trajectory_warmup_s: float = 1.0
+    trajectory_x_step_m: float = 0.0
+    trajectory_x_amp_m: float = 0.25
+    trajectory_period_s: float = 6.0
+    trajectory_x_bias_m: float = 0.0
+    trajectory_y_bias_m: float = 0.0
+    yaw_control_mode: str = "off"
+    yaw_heading_kp: float = 2.2
+    yaw_heading_kd: float = 0.8
+    yaw_lateral_pos_k: float = 0.7
+    yaw_max_force: float = 0.9
+    yaw_min_speed_m_s: float = 0.03
 
 
 class ControllerEvaluator:
@@ -646,6 +659,89 @@ class ControllerEvaluator:
             )
         return np.asarray(y, dtype=float)
 
+    def _trajectory_reference_xy(self, step: int, config: EpisodeConfig) -> tuple[float, float]:
+        profile = str(getattr(config, "trajectory_profile", "none")).strip().lower()
+        x0 = float(self.X_REF)
+        y0 = float(self.Y_REF)
+        if profile in {"", "none", "off"}:
+            return x0, y0
+
+        t_s = float(step) * float(self.dt)
+        warmup_s = float(max(getattr(config, "trajectory_warmup_s", 0.0), 0.0))
+        if t_s < warmup_s:
+            return x0, y0
+
+        tau = t_s - warmup_s
+        x_bias = float(getattr(config, "trajectory_x_bias_m", 0.0))
+        y_bias = float(getattr(config, "trajectory_y_bias_m", 0.0))
+        x_ref = x0 + x_bias
+        y_ref = y0 + y_bias
+
+        if profile in {"step", "step_x"}:
+            x_ref += float(getattr(config, "trajectory_x_step_m", 0.0))
+            return x_ref, y_ref
+
+        if profile in {"line_sine", "line", "straight_line"}:
+            amp = float(max(getattr(config, "trajectory_x_amp_m", 0.0), 0.0))
+            period_s = float(max(getattr(config, "trajectory_period_s", 1e-3), 1e-3))
+            x_ref += amp * float(np.sin((2.0 * np.pi * tau) / period_s))
+            return x_ref, y_ref
+
+        return x0, y0
+
+    @staticmethod
+    def _wrap_angle_rad(angle_rad: float) -> float:
+        return float((angle_rad + np.pi) % (2.0 * np.pi) - np.pi)
+
+    def _compute_virtual_yaw_correction(
+        self,
+        config: EpisodeConfig,
+        x_state: np.ndarray,
+        x_ref_now: float,
+        y_ref_now: float,
+        x_ref_next: float,
+        y_ref_next: float,
+    ) -> tuple[np.ndarray, float]:
+        mode = str(getattr(config, "yaw_control_mode", "off")).strip().lower()
+        if mode in {"", "off", "none"}:
+            return np.zeros(2, dtype=float), float("nan")
+
+        traj_dx = float(x_ref_next - x_ref_now)
+        traj_dy = float(y_ref_next - y_ref_now)
+        traj_norm = float(np.hypot(traj_dx, traj_dy))
+        if traj_norm < 1e-6:
+            traj_dx = float(x_ref_now - x_state[5])
+            traj_dy = float(y_ref_now - x_state[6])
+            traj_norm = float(np.hypot(traj_dx, traj_dy))
+        if traj_norm < 1e-6:
+            return np.zeros(2, dtype=float), float("nan")
+
+        desired_heading = float(np.arctan2(traj_dy, traj_dx))
+        vx = float(x_state[7])
+        vy = float(x_state[8])
+        speed = float(np.hypot(vx, vy))
+        min_speed = float(max(getattr(config, "yaw_min_speed_m_s", 0.03), 1e-6))
+        if speed >= min_speed:
+            heading = float(np.arctan2(vy, vx))
+        else:
+            heading = desired_heading
+
+        heading_err = self._wrap_angle_rad(desired_heading - heading)
+        nx = float(-np.sin(desired_heading))
+        ny = float(np.cos(desired_heading))
+        lateral_speed = float(vx * nx + vy * ny)
+        lateral_pos = float((float(x_state[5]) - x_ref_now) * nx + (float(x_state[6]) - y_ref_now) * ny)
+
+        kp = float(max(getattr(config, "yaw_heading_kp", 0.0), 0.0))
+        kd = float(max(getattr(config, "yaw_heading_kd", 0.0), 0.0))
+        kpos = float(max(getattr(config, "yaw_lateral_pos_k", 0.0), 0.0))
+        u_lat = float(kp * heading_err - kd * lateral_speed - kpos * lateral_pos)
+        u_max = float(max(getattr(config, "yaw_max_force", 0.0), 0.0))
+        if u_max > 0.0:
+            u_lat = float(np.clip(u_lat, -u_max, u_max))
+        correction = np.array([u_lat * nx, u_lat * ny], dtype=float)
+        return correction, heading_err
+
     def simulate_episode(
         self,
         params: CandidateParams,
@@ -746,6 +842,16 @@ class ControllerEvaluator:
         com_over_support_steps = 0
         com_fail_streak = 0
         com_fail_streak_max = 0
+        tracking_err_sq_acc = 0.0
+        tracking_err_abs_acc = 0.0
+        tracking_err_peak = 0.0
+        tracking_x_abs_acc = 0.0
+        tracking_y_abs_acc = 0.0
+        tracking_samples = 0
+        tracking_err_series: list[float] = []
+        heading_err_abs_acc = 0.0
+        heading_err_max_abs = 0.0
+        heading_samples = 0
 
         family = str(getattr(config, "controller_family", "current"))
         low_spin_robust = (config.stability_profile == "low-spin-robust") and family in ("current", "current_dob", "hybrid_modern")
@@ -824,6 +930,8 @@ class ControllerEvaluator:
                 ],
                 dtype=float,
             )
+            x_ref_cmd, y_ref_cmd = self._trajectory_reference_xy(step, config)
+            x_ref_next, y_ref_next = self._trajectory_reference_xy(step + 1, config)
 
             # Continuous predictor at simulation rate.
             x_pred = A_run_step @ x_est + B_run_step @ u_eff_applied
@@ -849,14 +957,29 @@ class ControllerEvaluator:
                     x_est[8] = x_true[8]
 
                 x_ctrl = x_est.copy()
-                x_ctrl[5] -= self.X_REF
-                x_ctrl[6] -= self.Y_REF
+                x_ctrl[5] -= x_ref_cmd
+                x_ctrl[6] -= y_ref_cmd
 
                 if self.base_integrator_enabled:
                     base_int[0] = np.clip(base_int[0] + x_ctrl[5] * control_dt, -self.INT_CLAMP, self.INT_CLAMP)
                     base_int[1] = np.clip(base_int[1] + x_ctrl[6] * control_dt, -self.INT_CLAMP, self.INT_CLAMP)
                 else:
                     base_int[:] = 0.0
+                yaw_base_corr = np.zeros(2, dtype=float)
+                if not legacy_family:
+                    yaw_base_corr, heading_err = self._compute_virtual_yaw_correction(
+                        config=config,
+                        x_state=x_est,
+                        x_ref_now=x_ref_cmd,
+                        y_ref_now=y_ref_cmd,
+                        x_ref_next=x_ref_next,
+                        y_ref_next=y_ref_next,
+                    )
+                    if np.isfinite(heading_err):
+                        heading_err_abs = abs(float(heading_err))
+                        heading_err_abs_acc += heading_err_abs
+                        heading_err_max_abs = max(heading_err_max_abs, heading_err_abs)
+                        heading_samples += 1
 
                 angle_mag = max(abs(float(x_true[0])), abs(float(x_true[1])))
                 rate_mag = max(abs(float(x_true[2])), abs(float(x_true[3])))
@@ -1079,13 +1202,13 @@ class ControllerEvaluator:
 
                 follow_alpha = float(np.clip(self.BASE_REF_FOLLOW_RATE_HZ * control_dt, 0.0, 1.0))
                 recenter_alpha = float(np.clip(self.BASE_REF_RECENTER_RATE_HZ * control_dt, 0.0, 1.0))
-                base_disp = float(np.hypot(x_est[5], x_est[6]))
+                base_disp = float(np.hypot(x_est[5] - x_ref_cmd, x_est[6] - y_ref_cmd))
                 if base_authority > 0.35 and base_disp < self.BASE_HOLD_RADIUS_M:
                     base_ref[0] += follow_alpha * (x_est[5] - base_ref[0])
                     base_ref[1] += follow_alpha * (x_est[6] - base_ref[1])
                 else:
-                    base_ref[0] += recenter_alpha * (0.0 - base_ref[0])
-                    base_ref[1] += recenter_alpha * (0.0 - base_ref[1])
+                    base_ref[0] += recenter_alpha * (x_ref_cmd - base_ref[0])
+                    base_ref[1] += recenter_alpha * (y_ref_cmd - base_ref[1])
 
                 base_x_err = float(np.clip(x_est[5] - base_ref[0], -self.BASE_CENTERING_POS_CLIP_M, self.BASE_CENTERING_POS_CLIP_M))
                 base_y_err = float(np.clip(x_est[6] - base_ref[1], -self.BASE_CENTERING_POS_CLIP_M, self.BASE_CENTERING_POS_CLIP_M))
@@ -1108,7 +1231,9 @@ class ControllerEvaluator:
                 base_target_x = (1.0 - base_authority) * hold_x + base_authority * balance_x
                 base_target_y = (1.0 - base_authority) * hold_y + base_authority * balance_y
                 if balance_phase == "hold" and self.HOLD_BASE_X_CENTERING_GAIN > 0.0:
-                    hold_center_err_x = float(np.clip(x_est[5], -self.BASE_CENTERING_POS_CLIP_M, self.BASE_CENTERING_POS_CLIP_M))
+                    hold_center_err_x = float(
+                        np.clip(x_est[5] - x_ref_cmd, -self.BASE_CENTERING_POS_CLIP_M, self.BASE_CENTERING_POS_CLIP_M)
+                    )
                     base_target_x += float(-self.HOLD_BASE_X_CENTERING_GAIN * hold_center_err_x)
                 if self.base_integrator_enabled:
                     base_target_x += -params.ki_base * base_int[0]
@@ -1117,8 +1242,9 @@ class ControllerEvaluator:
                     base_target_x = 0.0
                     base_target_y = 0.0
                 if mpc_family:
-                    base_target_x = float(u_target_mpc[1])
-                    base_target_y = float(u_target_mpc[2])
+                    u_base_raw = np.asarray(u_target_mpc[1:3], dtype=float) + yaw_base_corr
+                    base_target_x = float(u_base_raw[0])
+                    base_target_y = float(u_base_raw[1])
                 if robust_hinf_family:
                     base_target_x += float(-0.12 * x_est[7] - 0.06 * x_est[5] - 0.06 * x_est[1])
                     base_target_y += float(-0.12 * x_est[8] - 0.06 * x_est[6] + 0.06 * x_est[0])
@@ -1158,6 +1284,9 @@ class ControllerEvaluator:
                         np.clip(-0.32 * self.WHEEL_TO_BASE_BIAS_GAIN * wheel_momentum_bias_int, -0.25, 0.25)
                     )
                     base_target_x += hold_bias_term
+                if (not legacy_family) and (not mpc_family):
+                    base_target_x += float(yaw_base_corr[0])
+                    base_target_y += float(yaw_base_corr[1])
 
                 du_base_cmd = np.array([base_target_x, base_target_y]) - u_eff_applied[1:]
                 base_du_limit = max_du[1:].copy()
@@ -1294,9 +1423,11 @@ class ControllerEvaluator:
 
             base_x = float(self.data.qpos[self.q_base_x])
             base_y = float(self.data.qpos[self.q_base_y])
-            if abs(base_x) > self.BASE_HOLD_RADIUS_M and np.sign(base_x_cmd) == np.sign(base_x):
+            base_x_rel = float(base_x - x_ref_cmd)
+            base_y_rel = float(base_y - y_ref_cmd)
+            if abs(base_x_rel) > self.BASE_HOLD_RADIUS_M and np.sign(base_x_cmd) == np.sign(base_x_rel):
                 base_x_cmd *= 0.4
-            if abs(base_y) > self.BASE_HOLD_RADIUS_M and np.sign(base_y_cmd) == np.sign(base_y):
+            if abs(base_y_rel) > self.BASE_HOLD_RADIUS_M and np.sign(base_y_cmd) == np.sign(base_y_rel):
                 base_y_cmd *= 0.4
 
             base_x_cmd = float(np.clip(base_x_cmd, -self.BASE_FORCE_SOFT_LIMIT, self.BASE_FORCE_SOFT_LIMIT))
@@ -1338,6 +1469,16 @@ class ControllerEvaluator:
             roll = float(self.data.qpos[self.q_roll])
             bx = float(self.data.qpos[self.q_base_x])
             by = float(self.data.qpos[self.q_base_y])
+            track_x_err = float(bx - x_ref_cmd)
+            track_y_err = float(by - y_ref_cmd)
+            track_err = float(np.hypot(track_x_err, track_y_err))
+            tracking_err_sq_acc += track_err * track_err
+            tracking_err_abs_acc += abs(track_err)
+            tracking_err_peak = max(tracking_err_peak, abs(track_err))
+            tracking_x_abs_acc += abs(track_x_err)
+            tracking_y_abs_acc += abs(track_y_err)
+            tracking_samples += 1
+            tracking_err_series.append(track_err)
             if collect_pitch_phase_trace:
                 pitch_phase_trace.append(
                     {
@@ -1464,6 +1605,26 @@ class ControllerEvaluator:
             "com_over_support_ratio": float(com_over_support_steps / max(steps_run, 1)),
             "com_fail_streak_max": float(com_fail_streak_max),
             "rms_base_drift_m": float(np.sqrt(drift_sq_acc / max(steps_run, 1))),
+            "tracking_rmse_m": float(np.sqrt(tracking_err_sq_acc / max(tracking_samples, 1))),
+            "tracking_mae_m": float(tracking_err_abs_acc / max(tracking_samples, 1)),
+            "tracking_peak_m": float(tracking_err_peak),
+            "tracking_x_mae_m": float(tracking_x_abs_acc / max(tracking_samples, 1)),
+            "tracking_y_mae_m": float(tracking_y_abs_acc / max(tracking_samples, 1)),
+            "tracking_p95_m": (
+                float(np.percentile(np.asarray(tracking_err_series, dtype=float), 95))
+                if tracking_err_series
+                else np.nan
+            ),
+            "heading_err_mae_deg": (
+                float(np.degrees(heading_err_abs_acc / heading_samples))
+                if heading_samples > 0
+                else np.nan
+            ),
+            "heading_err_max_deg": (
+                float(np.degrees(heading_err_max_abs))
+                if heading_samples > 0
+                else np.nan
+            ),
             "control_energy": control_energy / max(steps_run, 1),
             "mean_command_jerk": command_jerk_acc / updates_run,
             "mean_motion_activity": motion_activity_acc / max(steps_run, 1),
@@ -1531,6 +1692,14 @@ class ControllerEvaluator:
         episode_seeds: List[int],
         config: EpisodeConfig,
     ) -> Dict[str, float]:
+        def _nanmean(values: List[float]) -> float:
+            arr = np.asarray(values, dtype=float)
+            return float(np.nanmean(arr)) if np.any(np.isfinite(arr)) else np.nan
+
+        def _nanmax(values: List[float]) -> float:
+            arr = np.asarray(values, dtype=float)
+            return float(np.nanmax(arr)) if np.any(np.isfinite(arr)) else np.nan
+
         runtime_cfg_for_episode = self._resolve_runtime_cfg(config)
         per_episode = [self.simulate_episode(params, s, config) for s in episode_seeds]
         episode_score_list = [self._episode_composite_score(m, config.steps) for m in per_episode]
@@ -1542,6 +1711,14 @@ class ControllerEvaluator:
         worst_base_x = float(np.max([m["max_abs_base_x_m"] for m in per_episode]))
         worst_base_y = float(np.max([m["max_abs_base_y_m"] for m in per_episode]))
         mean_rms_drift = float(np.mean([m["rms_base_drift_m"] for m in per_episode]))
+        mean_tracking_rmse = _nanmean([m.get("tracking_rmse_m", np.nan) for m in per_episode])
+        mean_tracking_mae = _nanmean([m.get("tracking_mae_m", np.nan) for m in per_episode])
+        mean_tracking_p95 = _nanmean([m.get("tracking_p95_m", np.nan) for m in per_episode])
+        mean_tracking_x_mae = _nanmean([m.get("tracking_x_mae_m", np.nan) for m in per_episode])
+        mean_tracking_y_mae = _nanmean([m.get("tracking_y_mae_m", np.nan) for m in per_episode])
+        worst_tracking_peak = _nanmax([m.get("tracking_peak_m", np.nan) for m in per_episode])
+        mean_heading_err_mae_deg = _nanmean([m.get("heading_err_mae_deg", np.nan) for m in per_episode])
+        worst_heading_err_max_deg = _nanmax([m.get("heading_err_max_deg", np.nan) for m in per_episode])
         mean_energy = float(np.mean([m["control_energy"] for m in per_episode]))
         mean_jerk = float(np.mean([m["mean_command_jerk"] for m in per_episode]))
         mean_activity = float(np.mean([m["mean_motion_activity"] for m in per_episode]))
@@ -1624,6 +1801,14 @@ class ControllerEvaluator:
             "worst_base_x_m": worst_base_x,
             "worst_base_y_m": worst_base_y,
             "mean_rms_base_drift_m": mean_rms_drift,
+            "mean_tracking_rmse_m": mean_tracking_rmse,
+            "mean_tracking_mae_m": mean_tracking_mae,
+            "mean_tracking_p95_m": mean_tracking_p95,
+            "mean_tracking_x_mae_m": mean_tracking_x_mae,
+            "mean_tracking_y_mae_m": mean_tracking_y_mae,
+            "worst_tracking_peak_m": worst_tracking_peak,
+            "mean_heading_err_mae_deg": mean_heading_err_mae_deg,
+            "worst_heading_err_max_deg": worst_heading_err_max_deg,
             "mean_control_energy": mean_energy,
             "mean_command_jerk": mean_jerk,
             "mean_motion_activity": mean_activity,
@@ -1774,6 +1959,14 @@ def safe_evaluate_candidate(
             "worst_base_x_m": np.nan,
             "worst_base_y_m": np.nan,
             "mean_rms_base_drift_m": np.nan,
+            "mean_tracking_rmse_m": np.nan,
+            "mean_tracking_mae_m": np.nan,
+            "mean_tracking_p95_m": np.nan,
+            "mean_tracking_x_mae_m": np.nan,
+            "mean_tracking_y_mae_m": np.nan,
+            "worst_tracking_peak_m": np.nan,
+            "mean_heading_err_mae_deg": np.nan,
+            "worst_heading_err_max_deg": np.nan,
             "mean_control_energy": np.nan,
             "mean_command_jerk": np.nan,
             "mean_motion_activity": np.nan,

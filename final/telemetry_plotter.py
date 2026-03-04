@@ -18,10 +18,34 @@ except Exception:  # pragma: no cover - optional dependency
 try:
     import matplotlib.pyplot as plt
     from matplotlib.animation import FuncAnimation
+    from matplotlib.widgets import Button, Slider
 except Exception as exc:  # pragma: no cover - optional dependency
     raise RuntimeError(
         "matplotlib is required for telemetry plotting. Install with: pip install matplotlib"
     ) from exc
+
+
+@dataclass(frozen=True)
+class SliderSpec:
+    key: str
+    label: str
+    vmin: float
+    vmax: float
+    vinit: float
+    step: float | None = None
+
+
+SIM_TUNING_SPECS: tuple[SliderSpec, ...] = (
+    SliderSpec("base_pitch_kp", "base_p_kp", 0.0, 180.0, 90.0),
+    SliderSpec("base_pitch_kd", "base_p_kd", 0.0, 40.0, 20.0),
+    SliderSpec("base_roll_kp", "base_r_kp", 0.0, 120.0, 70.0),
+    SliderSpec("base_roll_kd", "base_r_kd", 0.0, 30.0, 18.0),
+    SliderSpec("wheel_momentum_k", "rw_mom_k", 0.0, 2.0, 0.9, 0.01),
+    SliderSpec("wheel_momentum_thresh_frac", "rw_mom_thr", 0.05, 0.90, 0.30, 0.01),
+    SliderSpec("u_bleed", "u_bleed", 0.60, 1.00, 0.95, 0.001),
+    SliderSpec("estimator_q_scale", "kf_q_scale", 0.05, 10.0, 1.00, 0.01),
+    SliderSpec("estimator_r_scale", "kf_r_scale", 0.05, 10.0, 1.00, 0.01),
+)
 
 
 def parse_args(argv=None):
@@ -40,10 +64,30 @@ def parse_args(argv=None):
         default=0.18,
         help="EWMA smoothing alpha for traces in [0,1]. Set 0 for raw.",
     )
+    parser.add_argument(
+        "--tuning-panel",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Show live tuning sliders that send parameter updates to MuJoCo runtime via UDP.",
+    )
+    parser.add_argument(
+        "--tune-target-host",
+        type=str,
+        default="127.0.0.1",
+        help="UDP host for tuning updates (sim receiver).",
+    )
+    parser.add_argument(
+        "--tune-target-port",
+        type=int,
+        default=9881,
+        help="UDP port for tuning updates (sim receiver).",
+    )
     args = parser.parse_args(argv)
     if args.source == "serial" and not args.serial_port:
         parser.error("--serial-port is required when --source serial")
     args.smooth_alpha = float(np.clip(args.smooth_alpha, 0.0, 1.0))
+    args.udp_port = int(np.clip(int(args.udp_port), 1, 65535))
+    args.tune_target_port = int(np.clip(int(args.tune_target_port), 1, 65535))
     return args
 
 
@@ -113,6 +157,34 @@ class _SerialReader:
 
     def close(self) -> None:
         self._ser.close()
+
+
+class _UdpTuningSender:
+    def __init__(self, host: str, port: int):
+        self._addr = (host, port)
+        self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self._sock.setblocking(False)
+        self.endpoint = f"udp://{host}:{port}"
+        self.sent_packets = 0
+        self.send_errors = 0
+
+    def send_values(self, values: dict[str, float]) -> bool:
+        payload = {
+            "schema": "mujoco_tuning_v1",
+            "source": "telemetry_plotter",
+            "values": {k: float(v) for k, v in values.items()},
+        }
+        raw = (json.dumps(payload, separators=(",", ":"), ensure_ascii=True) + "\n").encode("utf-8")
+        try:
+            self._sock.sendto(raw, self._addr)
+            self.sent_packets += 1
+            return True
+        except OSError:
+            self.send_errors += 1
+            return False
+
+    def close(self) -> None:
+        self._sock.close()
 
 
 @dataclass
@@ -260,6 +332,34 @@ def _last_finite(values: deque[float]) -> float:
     return float("nan")
 
 
+def _extract_runtime_tuning(frame: dict[str, Any]) -> dict[str, float]:
+    updates: dict[str, float] = {}
+    for spec in SIM_TUNING_SPECS:
+        value = _first_float(frame, f"tune_{spec.key}")
+        if math.isfinite(value):
+            updates[spec.key] = float(value)
+    return updates
+
+
+def _format_tuning_values(values: dict[str, float]) -> str:
+    short_map = (
+        ("base_pitch_kp", "bp_kp"),
+        ("base_pitch_kd", "bp_kd"),
+        ("base_roll_kp", "br_kp"),
+        ("base_roll_kd", "br_kd"),
+        ("wheel_momentum_k", "rw_k"),
+        ("wheel_momentum_thresh_frac", "rw_thr"),
+        ("u_bleed", "u_bleed"),
+        ("estimator_q_scale", "kf_q"),
+        ("estimator_r_scale", "kf_r"),
+    )
+    chunks: list[str] = []
+    for key, label in short_map:
+        if key in values and math.isfinite(values[key]):
+            chunks.append(f"{label}={values[key]:.3f}")
+    return " | ".join(chunks) if chunks else "no tuning data yet"
+
+
 def main(argv=None):
     args = parse_args(argv)
     if args.source == "udp":
@@ -269,10 +369,19 @@ def main(argv=None):
         reader = _SerialReader(args.serial_port, int(args.serial_baud))
         source_label = f"serial://{args.serial_port}@{args.serial_baud}"
 
+    tuning_sender: _UdpTuningSender | None = None
+    if args.tuning_panel:
+        tuning_sender = _UdpTuningSender(args.tune_target_host, int(args.tune_target_port))
+
     history = _History.create()
     total_frames = 0
+    runtime_tuning_values: dict[str, float] = {}
 
-    fig = plt.figure(figsize=(14, 8.6), constrained_layout=True)
+    slider_rows = int(math.ceil(len(SIM_TUNING_SPECS) / 3.0)) if args.tuning_panel else 0
+    bottom_space = float(np.clip(0.17 + slider_rows * 0.085, 0.24, 0.56)) if args.tuning_panel else 0.10
+
+    fig = plt.figure(figsize=(14.8, 9.0), constrained_layout=False)
+    fig.subplots_adjust(left=0.06, right=0.98, top=0.89, bottom=bottom_space, wspace=0.20, hspace=0.27)
     gs = fig.add_gridspec(2, 2, width_ratios=[1.35, 1.0], height_ratios=[1.0, 1.0])
     ax_att = fig.add_subplot(gs[0, 0])
     ax_rates = fig.add_subplot(gs[1, 0], sharex=ax_att)
@@ -287,13 +396,21 @@ def main(argv=None):
             spine.set_color("#b0b8c4")
         ax.tick_params(colors="#2b3442", labelsize=9)
 
-    fig.suptitle("Telemetry Dashboard", fontsize=16, fontweight="bold", color="#1d2530")
+    fig.suptitle("MuJoCo Telemetry Dashboard", fontsize=16, fontweight="bold", color="#1d2530")
     fig.text(
         0.01,
-        0.965,
+        0.955,
         f"Source: {source_label}   |   Window: {args.window_s:.1f}s   |   Smooth alpha: {args.smooth_alpha:.2f}",
         fontsize=9,
         color="#4b5563",
+    )
+    fig.text(
+        0.01,
+        0.934,
+        "Sim-first parameter ID workflow: tune in MuJoCo with sliders, then transfer the same knobs to HIL hardware.",
+        fontsize=9,
+        color="#0f4c81",
+        fontweight="bold",
     )
 
     ax_att.set_title("Attitude", fontsize=11, fontweight="bold")
@@ -312,8 +429,6 @@ def main(argv=None):
     ax_rates.axhline(0.0, color="#8b949e", linewidth=1.0, alpha=0.8)
     ax_cmd.axhline(0.0, color="#8b949e", linewidth=1.0, alpha=0.8)
     ax_wheel.axhline(0.0, color="#8b949e", linewidth=1.0, alpha=0.8)
-
-    # Reference band near upright.
     ax_att.axhspan(-5.0, 5.0, color="#e8f5e9", alpha=0.55, zorder=0)
 
     line_pitch, = ax_att.plot([], [], color="#0f4c81", linewidth=2.1, label="pitch (deg)")
@@ -331,6 +446,7 @@ def main(argv=None):
     ax_wheel.legend(loc="upper left", frameon=True, framealpha=0.92, fontsize=8)
 
     status_text = fig.text(0.01, 0.01, "", fontsize=9, color="#2d3748")
+    tuning_status_text = fig.text(0.01, max(0.04, bottom_space - 0.03), "", fontsize=8, color="#1f2937")
 
     plotted_lines = [
         line_pitch,
@@ -343,12 +459,101 @@ def main(argv=None):
         line_wheel,
     ]
 
+    slider_objs: dict[str, Slider] = {}
+    slider_defaults = {spec.key: float(spec.vinit) for spec in SIM_TUNING_SPECS}
+    slider_values = slider_defaults.copy()
+    sync_state = {"suppress": False, "seeded_from_runtime": False}
+    push_button = None
+    reset_button = None
+
+    def _send_tuning(values: dict[str, float]) -> None:
+        if tuning_sender is None:
+            return
+        tuning_sender.send_values(values)
+
+    if args.tuning_panel:
+        if Slider is None or Button is None:
+            raise RuntimeError("matplotlib widgets are unavailable; disable with --no-tuning-panel")
+
+        cols = 3
+        col_width = 0.30
+        col_x = (0.06, 0.37, 0.68)
+        row_height = 0.074
+        first_row_y = bottom_space - 0.07
+
+        for idx, spec in enumerate(SIM_TUNING_SPECS):
+            col = idx % cols
+            row = idx // cols
+            x = col_x[col]
+            y = first_row_y - row * row_height
+            ax_slider = fig.add_axes([x, y, col_width, 0.026], facecolor="#f7fafc")
+            slider = Slider(
+                ax=ax_slider,
+                label=spec.label,
+                valmin=spec.vmin,
+                valmax=spec.vmax,
+                valinit=float(spec.vinit),
+                valstep=spec.step,
+            )
+            slider_objs[spec.key] = slider
+
+            def _make_handler(key: str):
+                def _handler(value):
+                    if sync_state["suppress"]:
+                        return
+                    slider_values[key] = float(value)
+                    _send_tuning({key: float(value)})
+
+                return _handler
+
+            slider.on_changed(_make_handler(spec.key))
+
+        button_y = 0.02
+        ax_push = fig.add_axes([0.06, button_y, 0.11, 0.032])
+        push_button = Button(ax_push, "Push All")
+
+        def _on_push_all(_event):
+            payload = {key: float(slider.val) for key, slider in slider_objs.items()}
+            slider_values.update(payload)
+            _send_tuning(payload)
+
+        push_button.on_clicked(_on_push_all)
+
+        ax_reset = fig.add_axes([0.19, button_y, 0.11, 0.032])
+        reset_button = Button(ax_reset, "Reset")
+
+        def _on_reset(_event):
+            sync_state["suppress"] = True
+            for key, slider in slider_objs.items():
+                slider.set_val(slider_defaults[key])
+                slider_values[key] = float(slider_defaults[key])
+            sync_state["suppress"] = False
+            _send_tuning(slider_values.copy())
+
+        reset_button.on_clicked(_on_reset)
+
+    _ = push_button, reset_button
+
     def _refresh(_frame_id: int):
         nonlocal total_frames
         frames = reader.read_frames(max_frames=int(max(args.max_drain, 1)))
         total_frames += len(frames)
         for frame in frames:
             history.append_frame(frame)
+            runtime_tuning_values.update(_extract_runtime_tuning(frame))
+
+        if args.tuning_panel and (not sync_state["seeded_from_runtime"]) and runtime_tuning_values:
+            sync_state["suppress"] = True
+            for spec in SIM_TUNING_SPECS:
+                if spec.key not in runtime_tuning_values:
+                    continue
+                value = float(np.clip(runtime_tuning_values[spec.key], spec.vmin, spec.vmax))
+                if spec.key in slider_objs:
+                    slider_objs[spec.key].set_val(value)
+                slider_values[spec.key] = value
+            sync_state["suppress"] = False
+            sync_state["seeded_from_runtime"] = True
+
         if not history.t:
             return plotted_lines
         history.prune(args.window_s)
@@ -394,6 +599,16 @@ def main(argv=None):
                 u_rw=_fmt(_last_finite(history.u_rw), "{:+.3f}"),
             )
         )
+
+        if args.tuning_panel and tuning_sender is not None:
+            values_for_text = runtime_tuning_values if runtime_tuning_values else slider_values
+            tuning_status_text.set_text(
+                f"Tuning TX {tuning_sender.endpoint} packets={tuning_sender.sent_packets} errors={tuning_sender.send_errors}   "
+                + _format_tuning_values(values_for_text)
+            )
+        else:
+            tuning_status_text.set_text("Tuning panel disabled")
+
         return plotted_lines
 
     anim = FuncAnimation(
@@ -408,6 +623,8 @@ def main(argv=None):
         plt.show()
     finally:
         reader.close()
+        if tuning_sender is not None:
+            tuning_sender.close()
 
 
 if __name__ == "__main__":

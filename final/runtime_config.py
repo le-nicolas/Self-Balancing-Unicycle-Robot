@@ -203,6 +203,9 @@ class RuntimeConfig:
     telemetry_udp_port: int
     telemetry_serial_port: str | None
     telemetry_serial_baud: int
+    live_tuning_enabled: bool
+    live_tuning_udp_bind: str
+    live_tuning_udp_port: int
     preset: str
     stability_profile: str
     stable_demo_profile: bool
@@ -283,6 +286,13 @@ class RuntimeConfig:
     payload_com_fail_steps: int
     x_ref: float
     y_ref: float
+    trajectory_profile: str
+    trajectory_warmup_s: float
+    trajectory_x_step_m: float
+    trajectory_x_amp_m: float
+    trajectory_period_s: float
+    trajectory_x_bias_m: float
+    trajectory_y_bias_m: float
     linearize_pitch_rad: float
     linearize_roll_rad: float
     int_clamp: float
@@ -471,6 +481,24 @@ def parse_args(argv=None):
         type=int,
         default=115200,
         help="Serial baud rate for telemetry when --telemetry-transport serial.",
+    )
+    parser.add_argument(
+        "--live-tuning",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Enable live parameter tuning receiver (UDP JSON from slider panel).",
+    )
+    parser.add_argument(
+        "--live-tuning-udp-bind",
+        type=str,
+        default="127.0.0.1",
+        help="UDP bind address for live tuning updates.",
+    )
+    parser.add_argument(
+        "--live-tuning-udp-port",
+        type=int,
+        default=9881,
+        help="UDP bind port for live tuning updates.",
     )
     parser.add_argument(
         "--residual-model",
@@ -826,6 +854,48 @@ def parse_args(argv=None):
         default=15,
         help="Consecutive steps beyond support radius required to trigger overload failure.",
     )
+    parser.add_argument(
+        "--trajectory-profile",
+        choices=["none", "step_x", "line_sine"],
+        default="none",
+        help="Reference trajectory profile for base position tracking in live MuJoCo sim.",
+    )
+    parser.add_argument(
+        "--trajectory-warmup-s",
+        type=float,
+        default=1.0,
+        help="Warm-up time before trajectory command starts (s).",
+    )
+    parser.add_argument(
+        "--trajectory-step-m",
+        type=float,
+        default=0.18,
+        help="Step offset in X for --trajectory-profile step_x (m).",
+    )
+    parser.add_argument(
+        "--trajectory-amp-m",
+        type=float,
+        default=0.22,
+        help="Sine amplitude in X for --trajectory-profile line_sine (m).",
+    )
+    parser.add_argument(
+        "--trajectory-period-s",
+        type=float,
+        default=6.0,
+        help="Sine period for --trajectory-profile line_sine (s).",
+    )
+    parser.add_argument(
+        "--trajectory-x-bias-m",
+        type=float,
+        default=0.0,
+        help="Constant X reference offset (m).",
+    )
+    parser.add_argument(
+        "--trajectory-y-bias-m",
+        type=float,
+        default=0.0,
+        help="Constant Y reference offset (m).",
+    )
     parser.add_argument("--disturbance-mag", type=float, default=None)
     parser.add_argument("--disturbance-interval", type=int, default=None)
     parser.add_argument("--control-hz", type=float, default=250.0)
@@ -1118,6 +1188,78 @@ def parse_args(argv=None):
     parser.add_argument("--push-y", type=float, default=0.0, help="Scripted push force in Y (N).")
     parser.add_argument("--push-start-s", type=float, default=1.0, help="Scripted push start time (s).")
     parser.add_argument("--push-duration-s", type=float, default=0.0, help="Scripted push duration (s).")
+    parser.add_argument(
+        "--disturbance-rejection-test",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Run randomized physical push test and log recovery time metrics in simulation.",
+    )
+    parser.add_argument(
+        "--disturbance-body",
+        choices=["stick", "base_y", "base_x", "payload"],
+        default="stick",
+        help="Body used for randomized disturbance pushes.",
+    )
+    parser.add_argument(
+        "--disturbance-warmup-s",
+        type=float,
+        default=1.5,
+        help="Delay before the first randomized push (seconds).",
+    )
+    parser.add_argument(
+        "--disturbance-force-min",
+        type=float,
+        default=8.0,
+        help="Minimum randomized push force magnitude (N).",
+    )
+    parser.add_argument(
+        "--disturbance-force-max",
+        type=float,
+        default=16.0,
+        help="Maximum randomized push force magnitude (N).",
+    )
+    parser.add_argument(
+        "--disturbance-duration-min-s",
+        type=float,
+        default=0.08,
+        help="Minimum randomized push duration (seconds).",
+    )
+    parser.add_argument(
+        "--disturbance-duration-max-s",
+        type=float,
+        default=0.22,
+        help="Maximum randomized push duration (seconds).",
+    )
+    parser.add_argument(
+        "--disturbance-interval-min-s",
+        type=float,
+        default=2.0,
+        help="Minimum gap between randomized pushes (seconds).",
+    )
+    parser.add_argument(
+        "--disturbance-interval-max-s",
+        type=float,
+        default=4.5,
+        help="Maximum gap between randomized pushes (seconds).",
+    )
+    parser.add_argument(
+        "--disturbance-recovery-angle-deg",
+        type=float,
+        default=2.5,
+        help="Recovered when |pitch| and |roll| are below this angle (deg) for hold window.",
+    )
+    parser.add_argument(
+        "--disturbance-recovery-rate-deg-s",
+        type=float,
+        default=25.0,
+        help="Recovered when |pitch_rate| and |roll_rate| are below this rate (deg/s) for hold window.",
+    )
+    parser.add_argument(
+        "--disturbance-recovery-hold-s",
+        type=float,
+        default=0.35,
+        help="Required continuous time inside recovery thresholds to count as recovered.",
+    )
     parser.add_argument("--legacy-model", action="store_true", help="Disable hardware-realistic timing/noise model.")
     parser.add_argument(
         "--max-wheel-speed",
@@ -1614,6 +1756,10 @@ def build_config(args) -> RuntimeConfig:
     telemetry_serial_port_arg = getattr(args, "telemetry_serial_port", None)
     telemetry_serial_port = str(telemetry_serial_port_arg).strip() if telemetry_serial_port_arg else None
     telemetry_serial_baud = int(max(int(getattr(args, "telemetry_serial_baud", 115200)), 1200))
+    live_tuning_enabled = bool(getattr(args, "live_tuning", False))
+    live_tuning_udp_bind = str(getattr(args, "live_tuning_udp_bind", "127.0.0.1")).strip() or "127.0.0.1"
+    live_tuning_udp_port = int(getattr(args, "live_tuning_udp_port", 9881))
+    live_tuning_udp_port = int(np.clip(live_tuning_udp_port, 1, 65535))
 
     residual_scale = float(max(getattr(args, "residual_scale", 0.0), 0.0))
     residual_max_abs_u = np.array(
@@ -1666,6 +1812,15 @@ def build_config(args) -> RuntimeConfig:
     payload_mass_kg = float(max(getattr(args, "payload_mass", 0.0), 0.0))
     payload_support_radius_m = float(max(getattr(args, "payload_support_radius_m", 0.145), 0.01))
     payload_com_fail_steps = int(max(getattr(args, "payload_com_fail_steps", 15), 1))
+    trajectory_profile = str(getattr(args, "trajectory_profile", "none")).strip().lower()
+    if trajectory_profile not in {"none", "step_x", "line_sine"}:
+        trajectory_profile = "none"
+    trajectory_warmup_s = float(max(getattr(args, "trajectory_warmup_s", 1.0), 0.0))
+    trajectory_x_step_m = float(getattr(args, "trajectory_step_m", 0.18))
+    trajectory_x_amp_m = float(max(getattr(args, "trajectory_amp_m", 0.22), 0.0))
+    trajectory_period_s = float(max(getattr(args, "trajectory_period_s", 6.0), 0.5))
+    trajectory_x_bias_m = float(getattr(args, "trajectory_x_bias_m", 0.0))
+    trajectory_y_bias_m = float(getattr(args, "trajectory_y_bias_m", 0.0))
 
     return RuntimeConfig(
         controller_family=controller_family,
@@ -1679,6 +1834,9 @@ def build_config(args) -> RuntimeConfig:
         telemetry_udp_port=telemetry_udp_port,
         telemetry_serial_port=telemetry_serial_port,
         telemetry_serial_baud=telemetry_serial_baud,
+        live_tuning_enabled=live_tuning_enabled,
+        live_tuning_udp_bind=live_tuning_udp_bind,
+        live_tuning_udp_port=live_tuning_udp_port,
         preset=preset,
         stability_profile=stability_profile,
         stable_demo_profile=stable_demo_profile,
@@ -1763,6 +1921,13 @@ def build_config(args) -> RuntimeConfig:
         payload_com_fail_steps=payload_com_fail_steps,
         x_ref=0.0,
         y_ref=0.0,
+        trajectory_profile=trajectory_profile,
+        trajectory_warmup_s=trajectory_warmup_s,
+        trajectory_x_step_m=trajectory_x_step_m,
+        trajectory_x_amp_m=trajectory_x_amp_m,
+        trajectory_period_s=trajectory_period_s,
+        trajectory_x_bias_m=trajectory_x_bias_m,
+        trajectory_y_bias_m=trajectory_y_bias_m,
         linearize_pitch_rad=linearize_pitch_rad,
         linearize_roll_rad=linearize_roll_rad,
         int_clamp=2.0,

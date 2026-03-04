@@ -28,8 +28,45 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--mode", choices=["smooth", "robust"], default="smooth")
     parser.add_argument("--udp-port", type=int, default=9871)
+    parser.add_argument("--tune-port", type=int, default=9881, help="UDP port for live tuning slider commands.")
     parser.add_argument("--window-s", type=float, default=12.0)
     parser.add_argument("--start-delay-s", type=float, default=0.6, help="Delay between each process launch.")
+    parser.add_argument(
+        "--disturbance-test",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Enable randomized disturbance rejection test in the MuJoCo sim process.",
+    )
+    parser.add_argument(
+        "--sim-tuning-panel",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable the tuning slider panel in telemetry_plotter for sim-first tuning.",
+    )
+    parser.add_argument(
+        "--trajectory-benchmark",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Run trajectory_following_benchmark.py and exit (single-flag benchmark mode).",
+    )
+    parser.add_argument(
+        "--trajectory-benchmark-extra",
+        type=str,
+        default="",
+        help="Extra args appended to trajectory_following_benchmark.py when --trajectory-benchmark is enabled.",
+    )
+    parser.add_argument(
+        "--sim-trajectory-profile",
+        choices=["none", "step_x", "line_sine"],
+        default="none",
+        help="Trajectory reference profile for live MuJoCo sim tracking.",
+    )
+    parser.add_argument("--sim-trajectory-warmup-s", type=float, default=1.0)
+    parser.add_argument("--sim-trajectory-step-m", type=float, default=0.18)
+    parser.add_argument("--sim-trajectory-amp-m", type=float, default=0.22)
+    parser.add_argument("--sim-trajectory-period-s", type=float, default=6.0)
+    parser.add_argument("--sim-trajectory-x-bias-m", type=float, default=0.0)
+    parser.add_argument("--sim-trajectory-y-bias-m", type=float, default=0.0)
 
     parser.add_argument(
         "--with-hil",
@@ -61,6 +98,13 @@ def main() -> int:
     root = Path(__file__).resolve().parent
     py = sys.executable
 
+    if args.trajectory_benchmark:
+        bench_cmd = [py, str(root / "trajectory_following_benchmark.py")]
+        if args.trajectory_benchmark_extra.strip():
+            bench_cmd.extend(shlex.split(args.trajectory_benchmark_extra))
+        print("[play-all] benchmark:", " ".join(shlex.quote(c) for c in bench_cmd))
+        return int(subprocess.call(bench_cmd, cwd=str(root)))
+
     if args.with_hil and not args.esp32_ip:
         print("[play-all] error: --esp32-ip is required when --with-hil is enabled.")
         return 2
@@ -74,7 +118,15 @@ def main() -> int:
         str(args.udp_port),
         "--window-s",
         str(args.window_s),
+        "--tune-target-host",
+        "127.0.0.1",
+        "--tune-target-port",
+        str(args.tune_port),
     ]
+    if args.sim_tuning_panel:
+        plotter_cmd.append("--tuning-panel")
+    else:
+        plotter_cmd.append("--no-tuning-panel")
     if args.plotter_extra.strip():
         plotter_cmd.extend(shlex.split(args.plotter_extra))
 
@@ -90,7 +142,28 @@ def main() -> int:
         "127.0.0.1",
         "--telemetry-udp-port",
         str(args.udp_port),
+        "--live-tuning",
+        "--live-tuning-udp-bind",
+        "127.0.0.1",
+        "--live-tuning-udp-port",
+        str(args.tune_port),
+        "--trajectory-profile",
+        str(args.sim_trajectory_profile),
+        "--trajectory-warmup-s",
+        str(args.sim_trajectory_warmup_s),
+        "--trajectory-step-m",
+        str(args.sim_trajectory_step_m),
+        "--trajectory-amp-m",
+        str(args.sim_trajectory_amp_m),
+        "--trajectory-period-s",
+        str(args.sim_trajectory_period_s),
+        "--trajectory-x-bias-m",
+        str(args.sim_trajectory_x_bias_m),
+        "--trajectory-y-bias-m",
+        str(args.sim_trajectory_y_bias_m),
     ]
+    if args.disturbance_test:
+        sim_cmd.append("--disturbance-rejection-test")
     if args.sim_extra.strip():
         sim_cmd.extend(shlex.split(args.sim_extra))
 

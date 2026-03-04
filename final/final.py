@@ -38,6 +38,7 @@ from control_core import (
 from residual_model import ResidualPolicy
 from adaptive_id import AdaptiveGainScheduler
 from telemetry_stream import create_telemetry_publisher
+from tuning_stream import create_tuning_receiver
 
 """
 Teaching-oriented MuJoCo balancing controller.
@@ -118,43 +119,78 @@ def lift_discrete_dynamics(A: np.ndarray, B: np.ndarray, steps: int) -> tuple[np
     return A_lift, B_lift
 
 
-def _render_drag_force_arrow(
+def _render_force_arrows(
     viewer: mujoco.viewer.Handle,
     data: mujoco.MjData,
-    body_id: int,
-    force_world: np.ndarray,
-    anchor_world: np.ndarray | None = None,
+    arrows: list[tuple[int, np.ndarray, np.ndarray, np.ndarray | None]],
 ) -> None:
-    """Draw a red world-space arrow showing current mouse drag force direction."""
+    """Render one or more world-space force arrows in the viewer overlay scene."""
     with viewer.lock():
         viewer.user_scn.ngeom = 0
         if viewer.user_scn.maxgeom < 1:
             return
-        force_mag = float(np.linalg.norm(force_world))
-        if force_mag <= 1e-6:
-            return
 
-        if anchor_world is not None and np.all(np.isfinite(anchor_world)):
-            start = np.array(anchor_world, dtype=float)
-        else:
-            if body_id <= 0 or body_id >= data.xipos.shape[0]:
-                return
-            start = np.array(data.xipos[body_id], dtype=float)
-        direction = force_world / force_mag
-        length = float(np.clip(0.02 * force_mag, 0.08, 0.45))
-        end = start + direction * length
+        geom_idx = 0
+        for body_id, force_world, color_rgba, anchor_world in arrows:
+            if geom_idx >= viewer.user_scn.maxgeom:
+                break
+            force_mag = float(np.linalg.norm(force_world))
+            if force_mag <= 1e-6:
+                continue
 
-        geom = viewer.user_scn.geoms[0]
-        mujoco.mjv_initGeom(
-            geom,
-            mujoco.mjtGeom.mjGEOM_ARROW,
-            np.zeros(3, dtype=float),
-            np.zeros(3, dtype=float),
-            np.eye(3, dtype=float).reshape(9),
-            np.array([1.0, 0.1, 0.1, 0.95], dtype=np.float32),
-        )
-        mujoco.mjv_connector(geom, mujoco.mjtGeom.mjGEOM_ARROW, 0.02, start, end)
-        viewer.user_scn.ngeom = 1
+            if anchor_world is not None and np.all(np.isfinite(anchor_world)):
+                start = np.array(anchor_world, dtype=float)
+            else:
+                if body_id <= 0 or body_id >= data.xipos.shape[0]:
+                    continue
+                start = np.array(data.xipos[body_id], dtype=float)
+            direction = force_world / force_mag
+            length = float(np.clip(0.02 * force_mag, 0.08, 0.45))
+            end = start + direction * length
+
+            geom = viewer.user_scn.geoms[geom_idx]
+            mujoco.mjv_initGeom(
+                geom,
+                mujoco.mjtGeom.mjGEOM_ARROW,
+                np.zeros(3, dtype=float),
+                np.zeros(3, dtype=float),
+                np.eye(3, dtype=float).reshape(9),
+                color_rgba.astype(np.float32, copy=False),
+            )
+            mujoco.mjv_connector(geom, mujoco.mjtGeom.mjGEOM_ARROW, 0.02, start, end)
+            geom_idx += 1
+
+        viewer.user_scn.ngeom = geom_idx
+
+
+def _trajectory_reference_xy(
+    step: int,
+    cfg,
+    dt: float,
+    x0: float,
+    y0: float,
+) -> tuple[float, float]:
+    profile = str(getattr(cfg, "trajectory_profile", "none")).strip().lower()
+    if profile in {"", "none", "off"}:
+        return float(x0), float(y0)
+
+    t_s = float(step) * float(dt)
+    warmup_s = float(max(getattr(cfg, "trajectory_warmup_s", 0.0), 0.0))
+    if t_s < warmup_s:
+        return float(x0), float(y0)
+
+    tau = t_s - warmup_s
+    x_ref = float(x0 + float(getattr(cfg, "trajectory_x_bias_m", 0.0)))
+    y_ref = float(y0 + float(getattr(cfg, "trajectory_y_bias_m", 0.0)))
+    if profile in {"step", "step_x"}:
+        x_ref += float(getattr(cfg, "trajectory_x_step_m", 0.0))
+        return x_ref, y_ref
+    if profile in {"line", "line_sine", "straight_line"}:
+        amp = float(max(getattr(cfg, "trajectory_x_amp_m", 0.0), 0.0))
+        period_s = float(max(getattr(cfg, "trajectory_period_s", 1e-3), 1e-3))
+        x_ref += amp * float(np.sin((2.0 * np.pi * tau) / period_s))
+        return x_ref, y_ref
+    return float(x0), float(y0)
 
 
 def main():
@@ -185,6 +221,13 @@ def main():
         "base_x": ids.base_x_body_id,
         "payload": ids.payload_body_id,
     }[args.push_body]
+    disturbance_body = str(getattr(args, "disturbance_body", "stick"))
+    disturbance_body_id = {
+        "stick": ids.stick_body_id,
+        "base_y": ids.base_y_body_id,
+        "base_x": ids.base_x_body_id,
+        "payload": ids.payload_body_id,
+    }[disturbance_body]
     # Linearize around configured operating point (defaults to upright).
     reset_state(
         model,
@@ -200,6 +243,27 @@ def main():
     # Controller update interval (used to lift model-step A/B to control-step A/B for gain design).
     control_steps = 1 if not cfg.hardware_realistic else max(1, int(round(1.0 / (model.opt.timestep * cfg.control_hz))))
     control_dt = control_steps * model.opt.timestep
+    disturbance_test_enabled = bool(getattr(args, "disturbance_rejection_test", False))
+    disturbance_warmup_s = float(max(getattr(args, "disturbance_warmup_s", 1.5), 0.0))
+    disturbance_force_min_n = float(max(getattr(args, "disturbance_force_min", 8.0), 0.0))
+    disturbance_force_max_n = float(max(getattr(args, "disturbance_force_max", disturbance_force_min_n), disturbance_force_min_n))
+    disturbance_duration_min_s = float(max(getattr(args, "disturbance_duration_min_s", 0.08), model.opt.timestep))
+    disturbance_duration_max_s = float(
+        max(getattr(args, "disturbance_duration_max_s", disturbance_duration_min_s), disturbance_duration_min_s)
+    )
+    disturbance_interval_min_s = float(max(getattr(args, "disturbance_interval_min_s", 2.0), model.opt.timestep))
+    disturbance_interval_max_s = float(
+        max(getattr(args, "disturbance_interval_max_s", disturbance_interval_min_s), disturbance_interval_min_s)
+    )
+    disturbance_recovery_angle_rad = float(np.radians(max(getattr(args, "disturbance_recovery_angle_deg", 2.5), 0.0)))
+    disturbance_recovery_rate_rad_s = float(np.radians(max(getattr(args, "disturbance_recovery_rate_deg_s", 25.0), 0.0)))
+    disturbance_recovery_hold_s = float(max(getattr(args, "disturbance_recovery_hold_s", 0.35), model.opt.timestep))
+    disturbance_interval_min_steps = max(int(round(disturbance_interval_min_s / model.opt.timestep)), 1)
+    disturbance_interval_max_steps = max(int(round(disturbance_interval_max_s / model.opt.timestep)), disturbance_interval_min_steps)
+    disturbance_duration_min_steps = max(int(round(disturbance_duration_min_s / model.opt.timestep)), 1)
+    disturbance_duration_max_steps = max(int(round(disturbance_duration_max_s / model.opt.timestep)), disturbance_duration_min_steps)
+    disturbance_recovery_hold_steps = max(int(round(disturbance_recovery_hold_s / model.opt.timestep)), 1)
+    disturbance_warmup_steps = max(int(round(disturbance_warmup_s / model.opt.timestep)), 0)
 
     # 3) Linearize XML-defined dynamics and build controller gains at control update interval.
     nx = 2 * model.nv + model.na
@@ -274,9 +338,36 @@ def main():
     if not cfg.allow_base_motion:
         wheel_hard_speed *= 1.10
     C = build_partial_measurement_matrix(cfg)
-    Qn = np.diag([1e-4, 1e-4, 1e-4, 1e-4, 1e-5, 1e-5, 1e-5, 1e-5, 1e-5])
-    Rn = build_measurement_noise_cov(cfg, wheel_lsb)
-    L = build_kalman_gain(A, Qn, C, Rn)
+    Qn_base = np.diag([1e-4, 1e-4, 1e-4, 1e-4, 1e-5, 1e-5, 1e-5, 1e-5, 1e-5])
+    Rn_base = build_measurement_noise_cov(cfg, wheel_lsb)
+    live_tuning_bounds: dict[str, tuple[float, float]] = {
+        "base_pitch_kp": (0.0, 180.0),
+        "base_pitch_kd": (0.0, 40.0),
+        "base_roll_kp": (0.0, 120.0),
+        "base_roll_kd": (0.0, 30.0),
+        "wheel_momentum_k": (0.0, 2.0),
+        "wheel_momentum_thresh_frac": (0.05, 0.90),
+        "u_bleed": (0.60, 1.00),
+        "estimator_q_scale": (0.05, 10.0),
+        "estimator_r_scale": (0.05, 10.0),
+    }
+    live_tuning_state: dict[str, float] = {
+        "base_pitch_kp": float(cfg.base_pitch_kp),
+        "base_pitch_kd": float(cfg.base_pitch_kd),
+        "base_roll_kp": float(cfg.base_roll_kp),
+        "base_roll_kd": float(cfg.base_roll_kd),
+        "wheel_momentum_k": float(cfg.wheel_momentum_k),
+        "wheel_momentum_thresh_frac": float(cfg.wheel_momentum_thresh_frac),
+        "u_bleed": float(cfg.u_bleed),
+        "estimator_q_scale": 1.0,
+        "estimator_r_scale": 1.0,
+    }
+    L = build_kalman_gain(
+        A,
+        Qn_base * live_tuning_state["estimator_q_scale"],
+        C,
+        Rn_base * live_tuning_state["estimator_r_scale"],
+    )
 
     ACT_IDS = np.array([ids.aid_rw, ids.aid_base_x, ids.aid_base_y], dtype=int)
     ACT_NAMES = np.array(["wheel_spin", "base_x_force", "base_y_force"])
@@ -412,6 +503,11 @@ def main():
     else:
         print(f"Telemetry endpoint (serial): {cfg.telemetry_serial_port}@{cfg.telemetry_serial_baud}")
     print(
+        "Live tuning: "
+        f"enabled={cfg.live_tuning_enabled} "
+        f"udp_bind={cfg.live_tuning_udp_bind}:{cfg.live_tuning_udp_port}"
+    )
+    print(
         f"dynamics_dt_model={model.opt.timestep:.6f}s "
         f"design_dt_control={control_dt:.6f}s "
         f"(control_steps={control_steps})"
@@ -483,6 +579,15 @@ def main():
     print(
         f"Base recenter: hold_radius={cfg.base_hold_radius_m:.2f}m "
         f"follow={cfg.base_ref_follow_rate_hz:.2f}Hz recenter={cfg.base_ref_recenter_rate_hz:.2f}Hz"
+    )
+    print(
+        "Trajectory reference: "
+        f"profile={cfg.trajectory_profile} "
+        f"warmup={cfg.trajectory_warmup_s:.2f}s "
+        f"step_x={cfg.trajectory_x_step_m:.3f}m "
+        f"amp_x={cfg.trajectory_x_amp_m:.3f}m "
+        f"period={cfg.trajectory_period_s:.2f}s "
+        f"bias=({cfg.trajectory_x_bias_m:.3f},{cfg.trajectory_y_bias_m:.3f})m"
     )
     print(
         f"Base smoothers: authority_rate={cfg.base_authority_rate_per_s:.2f}/s "
@@ -575,6 +680,22 @@ def main():
         f"body={args.push_body} F=({args.push_x:.2f}, {args.push_y:.2f})N "
         f"start={args.push_start_s:.2f}s duration={args.push_duration_s:.2f}s"
     )
+    print(f"Disturbance rejection test: enabled={disturbance_test_enabled}")
+    if disturbance_test_enabled:
+        print(
+            "Disturbance push config: "
+            f"body={disturbance_body} "
+            f"force=[{disturbance_force_min_n:.2f}, {disturbance_force_max_n:.2f}]N "
+            f"duration=[{disturbance_duration_min_s:.3f}, {disturbance_duration_max_s:.3f}]s "
+            f"interval=[{disturbance_interval_min_s:.2f}, {disturbance_interval_max_s:.2f}]s "
+            f"warmup={disturbance_warmup_s:.2f}s"
+        )
+        print(
+            "Disturbance recovery rule: "
+            f"angle<{np.degrees(disturbance_recovery_angle_rad):.2f}deg "
+            f"rate<{np.degrees(disturbance_recovery_rate_rad_s):.2f}deg/s "
+            f"hold={disturbance_recovery_hold_s:.2f}s"
+        )
     if cfg.hardware_safe:
         print("HARDWARE-SAFE profile active: conservative torque/slew/speed limits enabled.")
     if cfg.real_hardware_profile:
@@ -589,6 +710,25 @@ def main():
     upright_blend = 0.0
     despin_gain = 0.25
     rng = np.random.default_rng(cfg.seed)
+
+    def _sample_disturbance_interval_steps() -> int:
+        if disturbance_interval_max_steps <= disturbance_interval_min_steps:
+            return disturbance_interval_min_steps
+        return int(rng.integers(disturbance_interval_min_steps, disturbance_interval_max_steps + 1))
+
+    def _sample_disturbance_duration_steps() -> int:
+        if disturbance_duration_max_steps <= disturbance_duration_min_steps:
+            return disturbance_duration_min_steps
+        return int(rng.integers(disturbance_duration_min_steps, disturbance_duration_max_steps + 1))
+
+    def _sample_disturbance_force_world() -> np.ndarray:
+        if disturbance_force_max_n <= disturbance_force_min_n:
+            mag = disturbance_force_min_n
+        else:
+            mag = float(rng.uniform(disturbance_force_min_n, disturbance_force_max_n))
+        theta = float(rng.uniform(0.0, 2.0 * np.pi))
+        return np.array([mag * np.cos(theta), mag * np.sin(theta), 0.0], dtype=float)
+
     sensor_frontend_state = create_sensor_frontend_state(cfg)
     reset_sensor_frontend_state(sensor_frontend_state)
 
@@ -608,6 +748,10 @@ def main():
         high_spin_active,
         cmd_queue,
     ) = reset_controller_buffers(NX, NU, queue_len)
+    trajectory_x0 = float(cfg.x_ref)
+    trajectory_y0 = float(cfg.y_ref)
+    x_ref_cmd = trajectory_x0
+    y_ref_cmd = trajectory_y0
     dob_hat = np.zeros(NU, dtype=float)
     dob_raw = np.zeros(NU, dtype=float)
     dob_prev_x_est = None
@@ -653,6 +797,26 @@ def main():
     com_overload_failures = 0
     pitch_recovery_deadline_step = None
     prev_script_force = np.zeros(3, dtype=float)
+    disturbance_active = False
+    disturbance_force_world = np.zeros(3, dtype=float)
+    disturbance_end_step = -1
+    disturbance_duration_steps = 0
+    disturbance_push_id = 0
+    disturbance_pending_id: int | None = None
+    disturbance_recovery_start_time_s = 0.0
+    disturbance_recovery_stable_steps = 0
+    disturbance_peak_tilt_rad = 0.0
+    disturbance_peak_rate_rad_s = 0.0
+    disturbance_pending_force_world = np.zeros(3, dtype=float)
+    disturbance_pending_duration_steps = 0
+    disturbance_next_step = disturbance_warmup_steps
+    disturbance_push_count = 0
+    disturbance_recovered_count = 0
+    disturbance_failed_count = 0
+    disturbance_last_recovery_s = float("nan")
+    disturbance_recovery_samples_s: list[float] = []
+    disturbance_peak_tilt_samples_deg: list[float] = []
+    disturbance_peak_rate_samples_deg_s: list[float] = []
     control_terms_writer = None
     control_terms_file = None
     trace_events_writer = None
@@ -757,6 +921,16 @@ def main():
                 "payload_mass_kg",
                 "com_planar_dist_m",
                 "com_over_support",
+                "disturbance_push_id",
+                "disturbance_force_x_n",
+                "disturbance_force_y_n",
+                "disturbance_force_mag_n",
+                "disturbance_duration_s",
+                "disturbance_duration_steps",
+                "disturbance_recovery_s",
+                "disturbance_peak_tilt_deg",
+                "disturbance_peak_rate_deg_s",
+                "disturbance_outcome",
             ],
         )
         trace_events_writer.writeheader()
@@ -766,6 +940,13 @@ def main():
             "Telemetry publisher: "
             f"{'active' if telemetry_publisher.active else 'inactive'} "
             f"endpoint={telemetry_publisher.endpoint}"
+        )
+    tuning_receiver = create_tuning_receiver(cfg)
+    if cfg.live_tuning_enabled:
+        print(
+            "Live tuning receiver: "
+            f"{'active' if tuning_receiver.active else 'inactive'} "
+            f"endpoint={tuning_receiver.endpoint}"
         )
 
     # 5) Closed-loop runtime: estimate -> control -> clamp -> simulate -> render.
@@ -780,6 +961,8 @@ def main():
             drag_anchor_body = -1
             drag_force_world = np.zeros(3, dtype=float)
             drag_anchor_world = None
+            scripted_push_active = False
+            scripted_push_force_world = np.zeros(3, dtype=float)
             # Pull GUI events/perturbations before control+step so dragging is applied immediately.
             viewer.sync()
             if np.any(prev_script_force):
@@ -840,7 +1023,116 @@ def main():
                 gain_schedule_scale_state = 1.0
                 pitch_recovery_deadline_step = None
                 reset_sensor_frontend_state(sensor_frontend_state)
+                if disturbance_test_enabled:
+                    disturbance_active = False
+                    disturbance_pending_id = None
+                    disturbance_recovery_stable_steps = 0
+                    disturbance_force_world[:] = 0.0
+                    disturbance_pending_force_world[:] = 0.0
+                    disturbance_pending_duration_steps = 0
+                    disturbance_next_step = step_count + _sample_disturbance_interval_steps()
                 continue
+
+            if disturbance_test_enabled:
+                if disturbance_active and step_count >= disturbance_end_step:
+                    disturbance_active = False
+                    disturbance_pending_id = disturbance_push_id
+                    disturbance_recovery_start_time_s = float(data.time)
+                    disturbance_recovery_stable_steps = 0
+                    print(
+                        f"[dist-test] PUSH#{disturbance_pending_id} ended at t={data.time:.2f}s; "
+                        "tracking recovery."
+                    )
+                    if trace_events_writer is not None:
+                        trace_events_writer.writerow(
+                            {
+                                "step": step_count,
+                                "sim_time_s": float(data.time),
+                                "event": "disturbance_push_end",
+                                "controller_family": cfg.controller_family,
+                                "balance_phase": balance_phase,
+                                "pitch": float(x_true[0]),
+                                "roll": float(x_true[1]),
+                                "pitch_rate": float(x_true[2]),
+                                "roll_rate": float(x_true[3]),
+                                "wheel_rate": float(x_true[4]),
+                                "wheel_rate_abs": float(abs(x_true[4])),
+                                "wheel_budget_speed": float(wheel_budget_speed),
+                                "wheel_hard_speed": float(wheel_hard_speed),
+                                "wheel_over_budget": int(abs(float(x_true[4])) > wheel_budget_speed),
+                                "wheel_over_hard": int(abs(float(x_true[4])) > wheel_hard_speed),
+                                "high_spin_active": int(high_spin_active),
+                                "base_x": float(x_true[5]),
+                                "base_y": float(x_true[6]),
+                                "u_rw": float(u_eff_applied[0]),
+                                "u_bx": float(u_eff_applied[1]),
+                                "u_by": float(u_eff_applied[2]),
+                                "payload_mass_kg": float(payload_mass_kg),
+                                "com_planar_dist_m": float(com_planar_dist),
+                                "com_over_support": int(com_planar_dist > cfg.payload_support_radius_m),
+                                "disturbance_push_id": int(disturbance_pending_id),
+                                "disturbance_force_x_n": float(disturbance_pending_force_world[0]),
+                                "disturbance_force_y_n": float(disturbance_pending_force_world[1]),
+                                "disturbance_force_mag_n": float(np.linalg.norm(disturbance_pending_force_world)),
+                                "disturbance_duration_s": float(disturbance_pending_duration_steps * model.opt.timestep),
+                                "disturbance_duration_steps": int(disturbance_pending_duration_steps),
+                                "disturbance_outcome": "ended",
+                            }
+                        )
+                if (not disturbance_active) and (disturbance_pending_id is None) and (step_count >= disturbance_next_step):
+                    disturbance_push_id += 1
+                    disturbance_push_count += 1
+                    disturbance_duration_steps = _sample_disturbance_duration_steps()
+                    disturbance_force_world = _sample_disturbance_force_world()
+                    disturbance_pending_force_world = disturbance_force_world.copy()
+                    disturbance_pending_duration_steps = disturbance_duration_steps
+                    disturbance_peak_tilt_rad = 0.0
+                    disturbance_peak_rate_rad_s = 0.0
+                    disturbance_end_step = step_count + disturbance_duration_steps
+                    disturbance_active = True
+                    print(
+                        f"[dist-test] PUSH#{disturbance_push_id} APPLIED at t={data.time:.2f}s "
+                        f"body={disturbance_body} "
+                        f"F=({disturbance_force_world[0]:+.2f}, {disturbance_force_world[1]:+.2f})N "
+                        f"|F|={np.linalg.norm(disturbance_force_world):.2f}N "
+                        f"duration={disturbance_duration_steps * model.opt.timestep:.3f}s"
+                    )
+                    if trace_events_writer is not None:
+                        trace_events_writer.writerow(
+                            {
+                                "step": step_count,
+                                "sim_time_s": float(data.time),
+                                "event": "disturbance_push_start",
+                                "controller_family": cfg.controller_family,
+                                "balance_phase": balance_phase,
+                                "pitch": float(x_true[0]),
+                                "roll": float(x_true[1]),
+                                "pitch_rate": float(x_true[2]),
+                                "roll_rate": float(x_true[3]),
+                                "wheel_rate": float(x_true[4]),
+                                "wheel_rate_abs": float(abs(x_true[4])),
+                                "wheel_budget_speed": float(wheel_budget_speed),
+                                "wheel_hard_speed": float(wheel_hard_speed),
+                                "wheel_over_budget": int(abs(float(x_true[4])) > wheel_budget_speed),
+                                "wheel_over_hard": int(abs(float(x_true[4])) > wheel_hard_speed),
+                                "high_spin_active": int(high_spin_active),
+                                "base_x": float(x_true[5]),
+                                "base_y": float(x_true[6]),
+                                "u_rw": float(u_eff_applied[0]),
+                                "u_bx": float(u_eff_applied[1]),
+                                "u_by": float(u_eff_applied[2]),
+                                "payload_mass_kg": float(payload_mass_kg),
+                                "com_planar_dist_m": float(com_planar_dist),
+                                "com_over_support": int(com_planar_dist > cfg.payload_support_radius_m),
+                                "disturbance_push_id": int(disturbance_push_id),
+                                "disturbance_force_x_n": float(disturbance_force_world[0]),
+                                "disturbance_force_y_n": float(disturbance_force_world[1]),
+                                "disturbance_force_mag_n": float(np.linalg.norm(disturbance_force_world)),
+                                "disturbance_duration_s": float(disturbance_duration_steps * model.opt.timestep),
+                                "disturbance_duration_steps": int(disturbance_duration_steps),
+                                "disturbance_outcome": "applied",
+                            }
+                        )
 
             # Estimator predictor runs at simulation step; control gains are designed on lifted control-step model.
             x_pred = A_step @ x_est + B_step @ u_eff_applied
@@ -848,6 +1140,34 @@ def main():
 
             if step_count % control_steps == 0:
                 control_updates += 1
+                if tuning_receiver.active:
+                    tuning_updates = tuning_receiver.drain_updates(max_packets=64)
+                    if tuning_updates:
+                        changed_fields: list[str] = []
+                        kalman_dirty = False
+                        for key, raw_value in tuning_updates.items():
+                            if key not in live_tuning_bounds:
+                                continue
+                            lo, hi = live_tuning_bounds[key]
+                            value = float(np.clip(raw_value, lo, hi))
+                            prev = live_tuning_state[key]
+                            if abs(value - prev) <= 1e-9:
+                                continue
+                            live_tuning_state[key] = value
+                            if key in {"estimator_q_scale", "estimator_r_scale"}:
+                                kalman_dirty = True
+                            else:
+                                object.__setattr__(cfg, key, value)
+                            changed_fields.append(f"{key}={value:.4f}")
+                        if kalman_dirty:
+                            L = build_kalman_gain(
+                                A,
+                                Qn_base * live_tuning_state["estimator_q_scale"],
+                                C,
+                                Rn_base * live_tuning_state["estimator_r_scale"],
+                            )
+                        if changed_fields:
+                            print("[live-tune] " + " ".join(changed_fields))
                 x_est = estimator_measurement_update(
                     cfg,
                     x_true,
@@ -921,6 +1241,15 @@ def main():
                             f"rls_updates={s.rls_updates} "
                             f"gain_recomputes={s.gain_recomputes}"
                         )
+                x_ref_cmd, y_ref_cmd = _trajectory_reference_xy(
+                    step=step_count,
+                    cfg=cfg,
+                    dt=float(model.opt.timestep),
+                    x0=trajectory_x0,
+                    y0=trajectory_y0,
+                )
+                object.__setattr__(cfg, "x_ref", float(x_ref_cmd))
+                object.__setattr__(cfg, "y_ref", float(y_ref_cmd))
                 (
                     u_cmd,
                     base_int,
@@ -1063,6 +1392,10 @@ def main():
                             "high_spin_active": int(high_spin_active),
                             "base_x": float(x_true[5]),
                             "base_y": float(x_true[6]),
+                            "x_ref": float(x_ref_cmd),
+                            "y_ref": float(y_ref_cmd),
+                            "track_err_x": float(x_true[5] - x_ref_cmd),
+                            "track_err_y": float(x_true[6] - y_ref_cmd),
                             "u_rw": float(u_cmd[0]),
                             "u_bx": float(u_cmd[1]),
                             "u_by": float(u_cmd[2]),
@@ -1080,6 +1413,12 @@ def main():
                         }
                     )
                 u_applied = apply_control_delay(cfg, cmd_queue, u_cmd)
+                scripted_push_now = bool(args.push_duration_s > 0.0 and args.push_start_s <= data.time < push_end_s)
+                disturbance_force_net = np.zeros(3, dtype=float)
+                if scripted_push_now:
+                    disturbance_force_net += push_force_world
+                if disturbance_test_enabled and disturbance_active:
+                    disturbance_force_net += disturbance_force_world
                 telemetry_publisher.publish(
                     sim_time_s=float(data.time),
                     frame={
@@ -1097,6 +1436,11 @@ def main():
                         "wheel_rate_rad_s": float(x_true[4]),
                         "base_x_m": float(x_true[5]),
                         "base_y_m": float(x_true[6]),
+                        "x_ref_m": float(x_ref_cmd),
+                        "y_ref_m": float(y_ref_cmd),
+                        "track_err_x_m": float(x_true[5] - x_ref_cmd),
+                        "track_err_y_m": float(x_true[6] - y_ref_cmd),
+                        "track_err_m": float(np.hypot(x_true[5] - x_ref_cmd, x_true[6] - y_ref_cmd)),
                         "base_vx_m_s": float(x_true[7]),
                         "base_vy_m_s": float(x_true[8]),
                         "pitch_est_rad": float(x_est[0]),
@@ -1107,12 +1451,33 @@ def main():
                         "u_rw_delayed": float(u_applied[0]),
                         "u_bx_delayed": float(u_applied[1]),
                         "u_by_delayed": float(u_applied[2]),
+                        "tune_base_pitch_kp": float(live_tuning_state["base_pitch_kp"]),
+                        "tune_base_pitch_kd": float(live_tuning_state["base_pitch_kd"]),
+                        "tune_base_roll_kp": float(live_tuning_state["base_roll_kp"]),
+                        "tune_base_roll_kd": float(live_tuning_state["base_roll_kd"]),
+                        "tune_wheel_momentum_k": float(live_tuning_state["wheel_momentum_k"]),
+                        "tune_wheel_momentum_thresh_frac": float(live_tuning_state["wheel_momentum_thresh_frac"]),
+                        "tune_u_bleed": float(live_tuning_state["u_bleed"]),
+                        "tune_estimator_q_scale": float(live_tuning_state["estimator_q_scale"]),
+                        "tune_estimator_r_scale": float(live_tuning_state["estimator_r_scale"]),
                         "high_spin_active": int(high_spin_active),
                         "wheel_budget_speed_rad_s": float(wheel_budget_speed),
                         "wheel_hard_speed_rad_s": float(wheel_hard_speed),
                         "disturbance_level": float(control_terms["disturbance_level"][0]),
                         "gain_schedule_scale": float(control_terms["gain_schedule_scale"][0]),
                         "com_planar_dist_m": float(com_planar_dist),
+                        "disturbance_push_active": int(
+                            scripted_push_now or (disturbance_test_enabled and disturbance_active)
+                        ),
+                        "disturbance_push_id": int(
+                            disturbance_push_id
+                            if (disturbance_test_enabled and (disturbance_active or disturbance_pending_id is not None))
+                            else -1
+                        ),
+                        "disturbance_force_x_n": float(disturbance_force_net[0]),
+                        "disturbance_force_y_n": float(disturbance_force_net[1]),
+                        "disturbance_recovery_pending": int(disturbance_pending_id is not None),
+                        "disturbance_last_recovery_s": float(disturbance_last_recovery_s),
                     },
                 )
             if balance_phase == "hold":
@@ -1144,8 +1509,8 @@ def main():
                     cfg=cfg,
                     base_x_speed=float(data.qvel[ids.v_base_x]),
                     base_y_speed=float(data.qvel[ids.v_base_y]),
-                    base_x=float(data.qpos[ids.q_base_x]),
-                    base_y=float(data.qpos[ids.q_base_y]),
+                    base_x=float(data.qpos[ids.q_base_x] - x_ref_cmd),
+                    base_y=float(data.qpos[ids.q_base_y] - y_ref_cmd),
                     base_x_request=float(u_drag[1]),
                     base_y_request=float(u_drag[2]),
                 )
@@ -1159,9 +1524,13 @@ def main():
             u_eff_applied[:] = [wheel_cmd, base_x_cmd, base_y_cmd]
             if args.planar_perturb:
                 data.xfrc_applied[:, 2] = 0.0
-            if args.push_duration_s > 0.0 and args.push_start_s <= data.time < push_end_s:
-                data.xfrc_applied[push_body_id, :3] += push_force_world
-                prev_script_force[:] = push_force_world
+            scripted_push_active = bool(args.push_duration_s > 0.0 and args.push_start_s <= data.time < push_end_s)
+            if scripted_push_active:
+                scripted_push_force_world = push_force_world.copy()
+                data.xfrc_applied[push_body_id, :3] += scripted_push_force_world
+                prev_script_force[:] = scripted_push_force_world
+            if disturbance_test_enabled and disturbance_active:
+                data.xfrc_applied[disturbance_body_id, :3] += disturbance_force_world
 
             mujoco.mj_step(model, data)
             if cfg.wheel_only:
@@ -1198,7 +1567,35 @@ def main():
                 com_fail_streak += 1
             else:
                 com_fail_streak = 0
-            _render_drag_force_arrow(viewer, data, drag_anchor_body, drag_force_world, anchor_world=drag_anchor_world)
+            overlay_arrows: list[tuple[int, np.ndarray, np.ndarray, np.ndarray | None]] = []
+            if np.linalg.norm(drag_force_world) > 1e-6:
+                overlay_arrows.append(
+                    (
+                        drag_anchor_body,
+                        drag_force_world,
+                        np.array([1.0, 0.1, 0.1, 0.95], dtype=np.float32),
+                        drag_anchor_world,
+                    )
+                )
+            if scripted_push_active:
+                overlay_arrows.append(
+                    (
+                        push_body_id,
+                        scripted_push_force_world,
+                        np.array([0.2, 0.75, 1.0, 0.95], dtype=np.float32),
+                        None,
+                    )
+                )
+            if disturbance_test_enabled and disturbance_active:
+                overlay_arrows.append(
+                    (
+                        disturbance_body_id,
+                        disturbance_force_world,
+                        np.array([1.0, 0.85, 0.15, 0.98], dtype=np.float32),
+                        None,
+                    )
+                )
+            _render_force_arrows(viewer, data, overlay_arrows)
             # Push latest state to viewer.
             viewer.sync()
 
@@ -1220,6 +1617,70 @@ def main():
             pitch_rate_now = float(data.qvel[ids.v_pitch])
             roll_rate_now = float(data.qvel[ids.v_roll])
             wheel_rate_now = float(data.qvel[ids.v_rw])
+            if disturbance_test_enabled and (disturbance_active or disturbance_pending_id is not None):
+                tilt_now = max(abs(pitch), abs(roll))
+                rate_now = max(abs(pitch_rate_now), abs(roll_rate_now))
+                disturbance_peak_tilt_rad = max(disturbance_peak_tilt_rad, tilt_now)
+                disturbance_peak_rate_rad_s = max(disturbance_peak_rate_rad_s, rate_now)
+            if disturbance_test_enabled and (disturbance_pending_id is not None) and (not disturbance_active):
+                recovered_now = (
+                    max(abs(pitch), abs(roll)) <= disturbance_recovery_angle_rad
+                    and max(abs(pitch_rate_now), abs(roll_rate_now)) <= disturbance_recovery_rate_rad_s
+                )
+                disturbance_recovery_stable_steps = disturbance_recovery_stable_steps + 1 if recovered_now else 0
+                if disturbance_recovery_stable_steps >= disturbance_recovery_hold_steps:
+                    disturbance_recovered_count += 1
+                    disturbance_last_recovery_s = float(data.time - disturbance_recovery_start_time_s)
+                    disturbance_recovery_samples_s.append(disturbance_last_recovery_s)
+                    disturbance_peak_tilt_samples_deg.append(float(np.degrees(disturbance_peak_tilt_rad)))
+                    disturbance_peak_rate_samples_deg_s.append(float(np.degrees(disturbance_peak_rate_rad_s)))
+                    print(
+                        f"[dist-test] PUSH#{disturbance_pending_id} RECOVERED in {disturbance_last_recovery_s:.3f}s "
+                        f"peak_tilt={np.degrees(disturbance_peak_tilt_rad):.2f}deg "
+                        f"peak_rate={np.degrees(disturbance_peak_rate_rad_s):.1f}deg/s"
+                    )
+                    if trace_events_writer is not None:
+                        trace_events_writer.writerow(
+                            {
+                                "step": step_count,
+                                "sim_time_s": float(data.time),
+                                "event": "disturbance_recovered",
+                                "controller_family": cfg.controller_family,
+                                "balance_phase": balance_phase,
+                                "pitch": float(pitch),
+                                "roll": float(roll),
+                                "pitch_rate": float(pitch_rate_now),
+                                "roll_rate": float(roll_rate_now),
+                                "wheel_rate": float(wheel_rate_now),
+                                "wheel_rate_abs": float(abs(wheel_rate_now)),
+                                "wheel_budget_speed": float(wheel_budget_speed),
+                                "wheel_hard_speed": float(wheel_hard_speed),
+                                "wheel_over_budget": int(abs(float(wheel_rate_now)) > wheel_budget_speed),
+                                "wheel_over_hard": int(abs(float(wheel_rate_now)) > wheel_hard_speed),
+                                "high_spin_active": int(high_spin_active),
+                                "base_x": float(base_x),
+                                "base_y": float(base_y),
+                                "u_rw": float(u_eff_applied[0]),
+                                "u_bx": float(u_eff_applied[1]),
+                                "u_by": float(u_eff_applied[2]),
+                                "payload_mass_kg": float(payload_mass_kg),
+                                "com_planar_dist_m": float(com_planar_dist),
+                                "com_over_support": int(com_planar_dist > cfg.payload_support_radius_m),
+                                "disturbance_push_id": int(disturbance_pending_id),
+                                "disturbance_force_x_n": float(disturbance_pending_force_world[0]),
+                                "disturbance_force_y_n": float(disturbance_pending_force_world[1]),
+                                "disturbance_force_mag_n": float(np.linalg.norm(disturbance_pending_force_world)),
+                                "disturbance_duration_s": float(disturbance_pending_duration_steps * model.opt.timestep),
+                                "disturbance_duration_steps": int(disturbance_pending_duration_steps),
+                                "disturbance_recovery_s": float(disturbance_last_recovery_s),
+                                "disturbance_peak_tilt_deg": float(np.degrees(disturbance_peak_tilt_rad)),
+                                "disturbance_peak_rate_deg_s": float(np.degrees(disturbance_peak_rate_rad_s)),
+                                "disturbance_outcome": "recovered",
+                            }
+                        )
+                    disturbance_pending_id = None
+                    disturbance_recovery_stable_steps = 0
+                    disturbance_next_step = step_count + _sample_disturbance_interval_steps()
 
             pitch_failed = abs(pitch) >= cfg.crash_angle_rad
             roll_failed = abs(roll) >= cfg.crash_angle_rad
@@ -1254,6 +1715,63 @@ def main():
                 roll_rate_at_crash = roll_rate_now
                 wheel_rate_at_crash = wheel_rate_now
                 crash_reason = "com_overload" if com_failed else (pitch_crash_reason if pitch_crash_confirmed else "roll_tilt")
+                if disturbance_test_enabled and (disturbance_active or disturbance_pending_id is not None):
+                    failed_push_id = disturbance_push_id if disturbance_active else int(disturbance_pending_id)
+                    failed_force = disturbance_force_world.copy() if disturbance_active else disturbance_pending_force_world.copy()
+                    failed_duration_steps = disturbance_duration_steps if disturbance_active else disturbance_pending_duration_steps
+                    disturbance_failed_count += 1
+                    disturbance_last_recovery_s = float("nan")
+                    print(
+                        f"[dist-test] PUSH#{failed_push_id} FAILED due to crash "
+                        f"(reason={crash_reason}) peak_tilt={np.degrees(disturbance_peak_tilt_rad):.2f}deg "
+                        f"peak_rate={np.degrees(disturbance_peak_rate_rad_s):.1f}deg/s"
+                    )
+                    if trace_events_writer is not None:
+                        trace_events_writer.writerow(
+                            {
+                                "step": step_count,
+                                "sim_time_s": float(data.time),
+                                "event": "disturbance_failed",
+                                "crash_reason": crash_reason,
+                                "controller_family": cfg.controller_family,
+                                "balance_phase": balance_phase,
+                                "pitch": float(pitch),
+                                "roll": float(roll),
+                                "pitch_rate": float(pitch_rate_at_crash),
+                                "roll_rate": float(roll_rate_at_crash),
+                                "wheel_rate": float(wheel_rate_at_crash),
+                                "wheel_rate_abs": float(abs(wheel_rate_at_crash)),
+                                "wheel_budget_speed": float(wheel_budget_speed),
+                                "wheel_hard_speed": float(wheel_hard_speed),
+                                "wheel_over_budget": int(abs(wheel_rate_at_crash) > wheel_budget_speed),
+                                "wheel_over_hard": int(abs(wheel_rate_at_crash) > wheel_hard_speed),
+                                "high_spin_active": int(high_spin_active),
+                                "base_x": float(data.qpos[ids.q_base_x]),
+                                "base_y": float(data.qpos[ids.q_base_y]),
+                                "u_rw": float(u_eff_applied[0]),
+                                "u_bx": float(u_eff_applied[1]),
+                                "u_by": float(u_eff_applied[2]),
+                                "payload_mass_kg": float(payload_mass_kg),
+                                "com_planar_dist_m": float(com_planar_dist),
+                                "com_over_support": int(com_planar_dist > cfg.payload_support_radius_m),
+                                "disturbance_push_id": int(failed_push_id),
+                                "disturbance_force_x_n": float(failed_force[0]),
+                                "disturbance_force_y_n": float(failed_force[1]),
+                                "disturbance_force_mag_n": float(np.linalg.norm(failed_force)),
+                                "disturbance_duration_s": float(failed_duration_steps * model.opt.timestep),
+                                "disturbance_duration_steps": int(failed_duration_steps),
+                                "disturbance_peak_tilt_deg": float(np.degrees(disturbance_peak_tilt_rad)),
+                                "disturbance_peak_rate_deg_s": float(np.degrees(disturbance_peak_rate_rad_s)),
+                                "disturbance_outcome": "failed_crash",
+                            }
+                        )
+                    disturbance_active = False
+                    disturbance_pending_id = None
+                    disturbance_recovery_stable_steps = 0
+                    disturbance_force_world[:] = 0.0
+                    disturbance_pending_force_world[:] = 0.0
+                    disturbance_pending_duration_steps = 0
+                    disturbance_next_step = step_count + _sample_disturbance_interval_steps()
                 if trace_events_writer is not None:
                     trace_events_writer.writerow(
                         {
@@ -1322,12 +1840,16 @@ def main():
                 gain_schedule_scale_state = 1.0
                 pitch_recovery_deadline_step = None
                 reset_sensor_frontend_state(sensor_frontend_state)
+                if disturbance_test_enabled:
+                    disturbance_peak_tilt_rad = 0.0
+                    disturbance_peak_rate_rad_s = 0.0
                 continue
 
     if control_terms_file is not None:
         control_terms_file.close()
     if trace_events_file is not None:
         trace_events_file.close()
+    tuning_receiver.close()
     telemetry_publisher.close()
 
     print("\n=== SIMULATION ENDED ===")
@@ -1398,11 +1920,40 @@ def main():
     print(f"Residual clipped count: {residual_clipped_count}")
     print(f"Residual gate-blocked count: {residual_gate_blocked_count}")
     print(f"Residual max |delta_u| [rw,bx,by]: {residual_max_abs}")
+    if disturbance_test_enabled:
+        print("\n=== DISTURBANCE REJECTION TEST ===")
+        print(
+            f"Random push outcomes: pushes={disturbance_push_count} "
+            f"recovered={disturbance_recovered_count} failed={disturbance_failed_count}"
+        )
+        if disturbance_recovery_samples_s:
+            rec = np.asarray(disturbance_recovery_samples_s, dtype=float)
+            tilt = np.asarray(disturbance_peak_tilt_samples_deg, dtype=float)
+            rate = np.asarray(disturbance_peak_rate_samples_deg_s, dtype=float)
+            print(
+                "Recovery time (s): "
+                f"mean={np.mean(rec):.3f} median={np.median(rec):.3f} "
+                f"p90={np.percentile(rec, 90):.3f} p95={np.percentile(rec, 95):.3f}"
+            )
+            print(
+                "Peak response: "
+                f"tilt_mean={np.mean(tilt):.2f}deg tilt_max={np.max(tilt):.2f}deg "
+                f"rate_mean={np.mean(rate):.1f}deg/s rate_max={np.max(rate):.1f}deg/s"
+            )
+        else:
+            print("Recovery time (s): no completed recovery samples yet.")
     if cfg.telemetry_enabled:
         print(
             "Telemetry frames: "
             f"sent={telemetry_publisher.sent_frames} "
             f"dropped={telemetry_publisher.dropped_frames}"
+        )
+    if cfg.live_tuning_enabled:
+        print(
+            "Live tuning stats: "
+            f"packets={tuning_receiver.received_packets} "
+            f"parse_errors={tuning_receiver.parse_errors} "
+            f"updates={tuning_receiver.received_updates}"
         )
 
 
